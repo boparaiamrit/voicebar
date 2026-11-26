@@ -46,4 +46,6 @@ jobs:
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./target/release/voicebar.exe --version
+        run: |
+          $p = Start-Process .\target\release\voicebar.exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }

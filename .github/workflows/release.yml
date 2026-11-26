@@ -50,7 +50,9 @@ jobs:
       - name: Version check (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: ./target/release/voicebar.exe --version
+        run: |
+          $p = Start-Process .\target\release\voicebar.exe -ArgumentList '--version' -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { exit $p.ExitCode }
 
       - name: Package portable zip (Windows)
         if: runner.os == 'Windows'
@@ -81,8 +83,8 @@ jobs:
           $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=!autostart', '/LOG=installer.log' -Wait -PassThru
           if ($p.ExitCode -ne 0) { Get-Content installer.log -Tail 40; exit 1 }
           $bin = "$env:LOCALAPPDATA\voicebar\bin"
-          & "$bin\voicebar.exe" --version
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $vp = Start-Process "$bin\voicebar.exe" -ArgumentList '--version' -Wait -PassThru -NoNewWindow
+          if ($vp.ExitCode -ne 0) { "voicebar --version exited $($vp.ExitCode)"; exit 1 }
           $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Voicebar.lnk"
           if (-not (Test-Path $lnk)) { 'Start menu shortcut missing'; exit 1 }
           $un = Get-ChildItem "$bin\unins*.exe" | Select-Object -First 1
