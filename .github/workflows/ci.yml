@@ -1,0 +1,49 @@
+name: CI
+
+# Every push and pull request: compile, run unit tests and verify `--version` on Windows and Linux.
+# macOS builds in the release workflow (tags / workflow_dispatch).
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libssl-dev \
+            libzstd-dev libdbus-1-dev pkg-config cmake clang
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --release --config 'profile.release.panic="unwind"' -- --nocapture
+
+      - name: Build release binary
+        run: cargo build --release --config 'profile.release.panic="unwind"'
+
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: ./target/release/voicebar --version
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./target/release/voicebar.exe --version

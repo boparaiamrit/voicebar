@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=Voicebar
+GenericName=Local GPU Voice Dictation
+Comment=Floating real-time local GPU voice dictation bar
+Exec=voicebar
+Icon=voicebar
+Terminal=false
+Type=Application
+Categories=Utility;AudioVideo;
+Keywords=voice;dictation;speech;transcription;gpu;nemotron;parakeet;

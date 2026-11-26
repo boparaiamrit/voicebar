@@ -1,0 +1,81 @@
+[package]
+name = "voicebar"
+version = "0.1.0"
+edition = "2024"
+description = "Fast, native local GPU voice dictation for Windows, macOS and Linux — always-on-top floating pill with NVIDIA Nemotron and Parakeet streaming."
+license = "MIT"
+authors = ["Amritpal Singh <boparaiamrit@gmail.com>"]
+repository = "https://github.com/boparaiamrit/voicebar"
+homepage = "https://github.com/boparaiamrit/voicebar"
+
+[[bin]]
+name = "voicebar"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "0.10.0"
+cpal = "0.15"
+# ksni: the Linux tray speaks StatusNotifierItem over D-Bus itself, so no GTK event loop is needed.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+reqwest = { version = "0.13", features = ["blocking"] }
+arboard = "3.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hound = "3.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+parakeet-rs = { version = "0.4.4", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+parakeet-rs = { version = "0.4.4", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[target.'cfg(not(windows))'.dependencies]
+global-hotkey = "0.7"
+
+[build-dependencies]
+winresource = "0.1.34"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "abort"
+
+# Linux packages, built after `cargo build --release`:
+#   cargo deb --no-build      (Debian, Ubuntu)
+#   cargo generate-rpm        (Fedora, RHEL)
+[package.metadata.deb]
+maintainer = "Amritpal Singh <boparaiamrit@gmail.com>"
+copyright = "2026, Amritpal Singh"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A floating, always-on-top local GPU voice dictation bar for Windows, macOS and Linux. \
+Press F1 from any window to stream live speech-to-text on your GPU with NVIDIA Nemotron \
+or Parakeet, then press F1 again to copy and auto-paste straight into your active input."""
+section = "utils"
+priority = "optional"
+depends = "$auto"
+assets = [
+    ["target/release/voicebar", "usr/bin/", "755"],
+    ["packaging/linux/voicebar.desktop", "usr/share/applications/", "644"],
+    ["assets/voicebar.png", "usr/share/icons/hicolor/512x512/apps/voicebar.png", "644"],
+    ["README.md", "usr/share/doc/voicebar/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Fast, native local GPU voice dictation bar"
+assets = [
+    { source = "target/release/voicebar", dest = "/usr/bin/voicebar", mode = "755" },
+    { source = "packaging/linux/voicebar.desktop", dest = "/usr/share/applications/voicebar.desktop", mode = "644" },
+    { source = "assets/voicebar.png", dest = "/usr/share/icons/hicolor/512x512/apps/voicebar.png", mode = "644" },
+    { source = "README.md", dest = "/usr/share/doc/voicebar/README.md", mode = "644", doc = true },
+    { source = "LICENSE", dest = "/usr/share/licenses/voicebar/LICENSE", mode = "644", doc = true },
+]

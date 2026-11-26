@@ -1,0 +1,12 @@
+/target
+/dist
+*.zip
+*.dmg
+*.deb
+*.rpm
+*.tar.gz
+*-setup.exe
+installer.log
+portable.txt
+voicebar-data/
+.DS_Store

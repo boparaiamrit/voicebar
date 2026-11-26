@@ -1,0 +1,202 @@
+name: Release
+
+# Push a tag like v0.1.0: build on Windows, macOS (Apple silicon) and Linux, run unit tests and
+# package tests, and attach every installer and archive to a GitHub Release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-arm64
+          - os: ubuntu-24.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig1-dev libfreetype6-dev libasound2-dev libssl-dev \
+            libzstd-dev libdbus-1-dev pkg-config cmake clang
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Unit tests
+        run: cargo test --release --config 'profile.release.panic="unwind"'
+
+      - name: Build
+        run: cargo build --release --config 'profile.release.panic="unwind"'
+
+      - name: Version check (macOS and Linux)
+        if: runner.os != 'Windows'
+        run: ./target/release/voicebar --version
+
+      - name: Version check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./target/release/voicebar.exe --version
+
+      - name: Package portable zip (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          New-Item -ItemType Directory -Force dist\voicebar | Out-Null
+          Copy-Item target\release\voicebar.exe, README.md, LICENSE dist\voicebar
+          Compress-Archive -Path dist\voicebar\* -DestinationPath "voicebar-$v-${{ matrix.name }}.zip"
+
+      - name: Installer (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}"
+          $ver = ((cargo metadata --no-deps --format-version 1 | ConvertFrom-Json).packages | Where-Object name -eq 'voicebar').version
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress | Out-Null }
+          & $iscc /Q "/DAppVersion=$ver" "/DOutputName=voicebar-$v-${{ matrix.name }}-setup" packaging\windows\voicebar.iss
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Copy-Item "dist\voicebar-$v-${{ matrix.name }}-setup.exe" .
+
+      - name: Installer test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $setup = Get-Item "voicebar-*-setup.exe"
+          $p = Start-Process $setup.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS=!autostart', '/LOG=installer.log' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content installer.log -Tail 40; exit 1 }
+          $bin = "$env:LOCALAPPDATA\voicebar\bin"
+          & "$bin\voicebar.exe" --version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $lnk = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Voicebar.lnk"
+          if (-not (Test-Path $lnk)) { 'Start menu shortcut missing'; exit 1 }
+          $un = Get-ChildItem "$bin\unins*.exe" | Select-Object -First 1
+          Start-Process $un.FullName -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait
+          for ($i = 0; $i -lt 60 -and (Test-Path "$bin\voicebar.exe"); $i++) { Start-Sleep -Seconds 1 }
+          if (Test-Path "$bin\voicebar.exe") { 'uninstalling left voicebar.exe'; exit 1 }
+          if (Test-Path $lnk) { 'uninstalling left the Start menu shortcut'; exit 1 }
+          'installer: install, run and uninstall ok'
+
+      - name: Package DMG (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          v="${GITHUB_REF_NAME}"
+          app=dist/Voicebar.app
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/voicebar "$app/Contents/MacOS/voicebar"
+
+          # Generate native AppIcon.icns from the 512x512 PNG
+          iconset=dist/AppIcon.iconset
+          mkdir -p "$iconset"
+          for sz in 16 32 128 256 512; do
+            sips -z $sz $sz assets/voicebar.png --out "$iconset/icon_${sz}x${sz}.png" >/dev/null
+            sz2=$((sz * 2))
+            if [ $sz2 -le 512 ]; then
+              sips -z $sz2 $sz2 assets/voicebar.png --out "$iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+            fi
+          done
+          iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+
+          cat > "$app/Contents/Info.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>CFBundleName</key><string>Voicebar</string>
+            <key>CFBundleDisplayName</key><string>Voicebar</string>
+            <key>CFBundleIdentifier</key><string>dev.voicebar.app</string>
+            <key>CFBundleExecutable</key><string>voicebar</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleIconFile</key><string>AppIcon</string>
+            <key>CFBundleShortVersionString</key><string>${v#v}</string>
+            <key>CFBundleVersion</key><string>${v#v}</string>
+            <key>LSMinimumSystemVersion</key><string>13.0</string>
+            <key>LSUIElement</key><true/>
+            <key>NSHighResolutionCapable</key><true/>
+            <key>NSMicrophoneUsageDescription</key><string>Voicebar needs microphone access to transcribe your speech locally on your GPU.</string>
+          </dict></plist>
+          EOF
+          codesign --force --deep --sign - "$app"
+          "$app/Contents/MacOS/voicebar" --version
+          hdiutil create -volname Voicebar -srcfolder "$app" -ov -format UDZO "voicebar-$v-${{ matrix.name }}.dmg"
+
+      - name: Package tarball (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          v="${GITHUB_REF_NAME}"
+          mkdir -p dist/voicebar
+          cp target/release/voicebar README.md LICENSE dist/voicebar/
+          cp assets/voicebar.png dist/voicebar/voicebar.png
+          cp packaging/linux/voicebar.desktop dist/voicebar/voicebar.desktop
+          tar -czf "voicebar-$v-${{ matrix.name }}.tar.gz" -C dist voicebar
+
+      - name: Linux packaging tools
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: deb and rpm (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          v="${GITHUB_REF_NAME}"
+          cargo deb --no-build -o "voicebar-$v-${{ matrix.name }}.deb"
+          cargo generate-rpm -o "voicebar-$v-${{ matrix.name }}.rpm"
+
+      - name: Package test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          v="${GITHUB_REF_NAME}"
+          sudo apt-get install -y "./voicebar-$v-${{ matrix.name }}.deb"
+          /usr/bin/voicebar --version
+          test -f /usr/share/applications/voicebar.desktop
+          sudo apt-get remove -y voicebar
+          test ! -e /usr/bin/voicebar
+          docker run --rm -v "$PWD:/w" fedora:41 bash -ec "
+            dnf install -y -q /w/voicebar-$v-${{ matrix.name }}.rpm
+            voicebar --version
+            rpm -q voicebar
+            dnf remove -y -q voicebar
+            test ! -e /usr/bin/voicebar"
+          echo "deb and rpm: install, run and remove ok"
+
+      - name: Keep the packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: voicebar-${{ matrix.name }}
+          path: |
+            voicebar-*.zip
+            voicebar-*.dmg
+            voicebar-*.tar.gz
+            voicebar-*-setup.exe
+            voicebar-*.deb
+            voicebar-*.rpm
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            voicebar-*.zip
+            voicebar-*.dmg
+            voicebar-*.tar.gz
+            voicebar-*-setup.exe
+            voicebar-*.deb
+            voicebar-*.rpm
+          generate_release_notes: true
