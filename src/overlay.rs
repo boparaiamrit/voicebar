@@ -1,13 +1,14 @@
 //! Two-window floating GPUI Kit UI for Voicebar:
 //! 1. `render_pill`: ultra-clean single-surface Dynamic Island capsule (fixed 548x68 px, never stretched).
-//! 2. `render_settings_popover`: dedicated floating Settings & Model card (376x380 px) anchored below.
+//! 2. `render_settings_popover`: dedicated floating Settings & Model card anchored below.
 
 use crate::audio::WAVEFORM_BARS;
 use crate::config::{ModelKind, is_model_ready};
 use crate::{
     Phase, VoiceState, cancel_dictation_from_window, close_settings_from_window,
     dismiss_overlay_from_window, select_language_from_settings, select_model_from_settings,
-    toggle_auto_paste_from_ui, toggle_autostart_from_ui, toggle_gpu_from_ui,
+    select_rewrite_language_from_ui, select_rewrite_model_from_ui, toggle_auto_paste_from_ui,
+    toggle_autostart_from_ui, toggle_gpu_from_ui, toggle_personal_rewrite_from_ui,
     toggle_settings_popover,
 };
 use gpui_kit::prelude::FluentBuilder;
@@ -15,8 +16,8 @@ use gpui_kit::*;
 
 pub const PILL_WIDTH: f32 = 548.0;
 pub const PILL_HEIGHT: f32 = 68.0;
-pub const SETTINGS_WIDTH: f32 = 382.0;
-pub const SETTINGS_HEIGHT: f32 = 384.0;
+pub const SETTINGS_WIDTH: f32 = 404.0;
+pub const SETTINGS_HEIGHT: f32 = 496.0;
 
 fn c(x: u32) -> Hsla {
     rgb(x).into()
@@ -47,7 +48,7 @@ pub fn ui_font() -> &'static str {
     })
 }
 
-fn icon(name: &str, sz: f32, color: Hsla) -> Svg {
+pub fn icon(name: &str, sz: f32, color: Hsla) -> Svg {
     svg()
         .path(SharedString::from(format!("icons/{name}.svg")))
         .size(px(sz))
@@ -70,6 +71,24 @@ fn visible_tail(text: &str, max_chars: usize) -> (bool, String) {
     (true, tail)
 }
 
+fn pill_switch(id: &'static str, on: bool) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(34.))
+        .h(px(19.))
+        .p(px(2.))
+        .rounded(px(999.))
+        .bg(if on { c(0x6366f1) } else { ca(0xffffff1a) })
+        .border_1()
+        .border_color(if on { ca(0x818cf888) } else { ca(0xffffff20) })
+        .flex()
+        .items_center()
+        .when(on, |d| d.justify_end())
+        .when(!on, |d| d.justify_start())
+        .cursor_pointer()
+        .child(div().size(px(13.)).rounded_full().bg(c(0xffffff)))
+}
+
 // =========================================================================
 // 1. Floating Dynamic Island Dictation Capsule (fixed 548 x 68 px)
 // =========================================================================
@@ -81,6 +100,8 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
     let transcript = state.live_text.clone();
     let bars = state.waveform;
     let settings_open = state.settings_open;
+    let is_rewriting = state.is_rewriting();
+    let fell_back = state.rewrite_fell_back;
     let tick = state.tick;
     let pulse_on = (tick / 12) % 2 == 0;
 
@@ -97,14 +118,16 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
     let border = match &phase {
         Phase::Listening { .. } => ca(0x818cf855),
         Phase::Loading { .. } | Phase::Downloading { .. } => ca(0x818cf842),
+        Phase::Finalizing if is_rewriting => ca(0xa78bfa55),
+        Phase::Copied { .. } if fell_back => ca(0xfbbf2466),
         Phase::Copied { .. } => ca(0x4ade8066),
         Phase::Error(_) => ca(0xf8717166),
         _ => ca(0xffffff1c),
     };
 
-    // Optional razor-thin progress/shimmer bar along the bottom edge (loading / downloading only).
+    // Optional razor-thin progress/shimmer bar along the bottom edge (loading / downloading / rewriting).
     let bottom_bar: Option<Div> = match &phase {
-        Phase::Loading { .. } => {
+        Phase::Loading { .. } | Phase::Finalizing if !matches!(phase, Phase::Finalizing) || is_rewriting => {
             let track_w = PILL_WIDTH - 48.0;
             let bar_w = 132.0f32;
             let t = ((tick % 52) as f32) / 52.0;
@@ -124,7 +147,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                             .w(px(bar_w))
                             .h_full()
                             .rounded(px(999.))
-                            .bg(indigo),
+                            .bg(if is_rewriting { violet } else { indigo }),
                     ),
             )
         }
@@ -176,7 +199,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                 div()
                     .size(px(8.))
                     .rounded_full()
-                    .bg(if matches!(phase, Phase::Finalizing) {
+                    .bg(if matches!(phase, Phase::Finalizing) && !is_rewriting {
                         amber
                     } else {
                         violet
@@ -194,6 +217,15 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
             .gap(px(8.))
             .window_control_area(WindowControlArea::Drag)
             .child(div().size(px(8.)).rounded_full().bg(indigo))
+            .into_any_element(),
+        Phase::Copied { .. } if fell_back => div()
+            .size(px(26.))
+            .rounded_full()
+            .bg(ca(0xfbbf2422))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(icon("check", 14., amber))
             .into_any_element(),
         Phase::Copied { .. } => div()
             .size(px(26.))
@@ -242,19 +274,37 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     )
                     .child(
                         div()
-                            .px(px(6.))
-                            .py(px(1.))
-                            .rounded(px(5.))
-                            .bg(ca(0xffffff0e))
-                            .border_1()
-                            .border_color(ca(0xffffff18))
-                            .text_size(px(11.))
-                            .text_color(text_dim)
-                            .child(if cfg.auto_paste {
-                                "F1 to paste"
+                            .px(px(7.))
+                            .py(px(2.))
+                            .rounded(px(6.))
+                            .bg(if cfg.personal_rewrite {
+                                ca(0x6366f124)
                             } else {
-                                "F1 to copy"
-                            }),
+                                ca(0xffffff0e)
+                            })
+                            .border_1()
+                            .border_color(if cfg.personal_rewrite {
+                                ca(0x818cf848)
+                            } else {
+                                ca(0xffffff18)
+                            })
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .when(cfg.personal_rewrite, |d| d.child(icon("sparkles", 10.5, indigo)))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(if cfg.personal_rewrite { indigo } else { text_dim })
+                                    .child(if cfg.personal_rewrite {
+                                        "F1 · Rewrite"
+                                    } else if cfg.auto_paste {
+                                        "F1 to paste"
+                                    } else {
+                                        "F1 to copy"
+                                    }),
+                            ),
                     )
                     .into_any_element()
             } else {
@@ -352,16 +402,27 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
             .h_full()
             .window_control_area(WindowControlArea::Drag)
             .flex()
+            .flex_row()
             .items_center()
-            .child(
-                div()
-                    .text_size(px(14.))
-                    .text_color(text_mid)
-                    .child("Finalizing…"),
-            )
+            .gap(px(6.))
+            .when(is_rewriting, |d| d.child(icon("sparkles", 13., violet)))
+            .child(div().text_size(px(13.5)).text_color(text_mid).child(
+                if is_rewriting {
+                    format!("Polishing with {}…", cfg.rewrite_model.short_label())
+                } else {
+                    "Finalizing…".to_string()
+                },
+            ))
             .into_any_element(),
         Phase::Copied { text, pasted } => {
-            let label = if *pasted { "Pasted" } else { "Copied" };
+            let label = if fell_back {
+                "Original copied"
+            } else if *pasted {
+                "Pasted"
+            } else {
+                "Copied"
+            };
+            let label_color = if fell_back { amber } else { emerald };
             let preview = if text.is_empty() {
                 "No speech detected".to_string()
             } else {
@@ -382,7 +443,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     div()
                         .text_size(px(13.))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(emerald)
+                        .text_color(label_color)
                         .child(label),
                 )
                 .child(
@@ -515,7 +576,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
 }
 
 // =========================================================================
-// 2. Separate Floating Settings & Model Popover (fixed 382 x 384 px)
+// 2. Separate Floating Settings & Model Popover (fixed 404 x 496 px)
 // =========================================================================
 
 pub fn render_settings_popover(cx: &mut App) -> AnyElement {
@@ -523,37 +584,57 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
     let cfg = state.config.clone();
     let backend = state.backend_label.clone();
     let autostart = state.autostart;
+    let has_profile = cfg.has_valid_profile();
+    let example_count = cfg
+        .rewrite_profile
+        .as_ref()
+        .map(|p| p.examples().len())
+        .unwrap_or(0);
 
-    let surface = ca(0x13131af8);
-    let border = ca(0xffffff1e);
+    let surface = ca(0x111119f9);
+    let card_bg = ca(0xffffff06);
+    let border = ca(0xffffff1a);
     let text_hi = c(0xf4f4f6);
     let text_mid = c(0xa1a1aa);
     let text_dim = c(0x71717a);
     let indigo = c(0x818cf8);
-    let indigo_bg = ca(0x6366f12a);
+    let indigo_bg = ca(0x6366f128);
     let emerald = c(0x4ade80);
-    let emerald_bg = ca(0x4ade8022);
+    let emerald_bg = ca(0x4ade8020);
 
     let header = div()
-        .h(px(28.))
+        .h(px(26.))
         .flex()
         .flex_row()
         .items_center()
         .gap(px(8.))
         .child(
             div()
+                .size(px(22.))
+                .rounded(px(7.))
+                .bg(indigo_bg)
+                .border_1()
+                .border_color(ca(0x818cf848))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(icon("mic", 12., indigo)),
+        )
+        .child(
+            div()
                 .text_size(px(13.))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(text_hi)
-                .child("Models & Settings"),
+                .child("Voicebar"),
         )
         .child(
             div()
                 .px(px(7.))
-                .py(px(1.))
+                .py(px(1.5))
                 .rounded(px(999.))
                 .bg(ca(0xffffff0c))
-                .text_size(px(10.5))
+                .text_size(px(10.))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(text_mid)
                 .child(backend),
         )
@@ -578,27 +659,40 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                 .on_click(|_, window, cx| close_settings_from_window(window, cx)),
         );
 
+    let models_header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .text_size(px(10.5))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(text_dim)
+                .child("SPEECH MODEL · LOCAL GPU"),
+        );
+
     let models_list = div()
         .flex()
         .flex_col()
-        .gap(px(5.))
+        .gap(px(4.))
         .children(ModelKind::ALL.into_iter().enumerate().map(move |(i, kind)| {
             let active = kind == cfg.model;
             let cached = is_model_ready(kind);
             div()
                 .id(ElementId::Name(SharedString::from(format!("set-m-{i}"))))
                 .px(px(10.))
-                .py(px(7.))
+                .py(px(6.5))
                 .rounded(px(10.))
-                .bg(if active { indigo_bg } else { ca(0xffffff07) })
+                .bg(if active { indigo_bg } else { card_bg })
                 .border_1()
                 .border_color(if active {
                     ca(0x818cf860)
                 } else {
-                    ca(0xffffff0f)
+                    ca(0xffffff0e)
                 })
                 .cursor_pointer()
-                .hover(|s| s.bg(ca(0xffffff16)))
+                .hover(|s| s.bg(ca(0xffffff14)))
                 .flex()
                 .flex_row()
                 .items_center()
@@ -607,7 +701,7 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                     div()
                         .size(px(7.))
                         .rounded_full()
-                        .bg(if active { indigo } else { ca(0xffffff28) }),
+                        .bg(if active { indigo } else { ca(0xffffff26) }),
                 )
                 .child(
                     div()
@@ -649,27 +743,44 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                 .on_click(move |_, window, cx| select_model_from_settings(window, cx, kind))
         }));
 
-    // Language row
+    // Spoken language row
     let lang_row = if cfg.model.supports_language_choice() {
-        let langs: [(&str, &str); 3] = [("en-US", "English"), ("hi-IN", "Hindi"), ("auto", "Auto")];
+        let langs: [(&str, &str); 4] = [
+            ("en-US", "EN"),
+            ("en-GB", "EN-IN"),
+            ("hi-IN", "Hindi"),
+            ("auto", "Auto"),
+        ];
         div()
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .pt(px(4.))
             .child(
                 div()
-                    .text_size(px(11.5))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(text_mid)
-                    .child("Language"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_mid)
+                            .child("Spoken"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.))
+                            .text_color(text_dim)
+                            .child("(+8 Indic in tray)"),
+                    ),
             )
             .child(
                 div()
                     .flex()
                     .flex_row()
-                    .gap(px(4.))
+                    .gap(px(3.))
                     .p(px(2.))
                     .rounded(px(8.))
                     .bg(ca(0xffffff08))
@@ -679,11 +790,11 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                         let on = cfg.language == code;
                         div()
                             .id(ElementId::Name(SharedString::from(format!("lang-{code}"))))
-                            .px(px(10.))
-                            .py(px(3.))
+                            .px(px(8.))
+                            .py(px(2.5))
                             .rounded(px(6.))
                             .bg(if on { indigo_bg } else { ca(0x00000000) })
-                            .text_size(px(11.5))
+                            .text_size(px(11.))
                             .font_weight(if on {
                                 FontWeight::SEMIBOLD
                             } else {
@@ -702,20 +813,289 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
             .flex_row()
             .items_center()
             .justify_between()
-            .pt(px(4.))
             .child(
                 div()
                     .text_size(px(11.5))
                     .text_color(text_mid)
-                    .child("Language"),
+                    .child("Spoken"),
             )
             .child(
                 div()
-                    .text_size(px(11.5))
+                    .text_size(px(11.))
                     .text_color(text_dim)
                     .child("English-only model (locked)"),
             )
     };
+
+    // Dedicated Optional Rephrasing Card — crystal-clear ON/OFF switch, zero layout cramping!
+    let rewrite_on = cfg.personal_rewrite;
+    let rewrite_model = cfg.rewrite_model;
+    let rewrite_status = if !rewrite_on {
+        ("OFF".to_string(), ca(0xffffff0e), text_dim)
+    } else if has_profile {
+        (
+            format!("Profile · {example_count}"),
+            emerald_bg,
+            emerald,
+        )
+    } else if cfg.legacy_rewrite {
+        ("Legacy".to_string(), indigo_bg, indigo)
+    } else {
+        ("Standard".to_string(), indigo_bg, indigo)
+    };
+
+    let rewrite_card = div()
+        .p(px(10.))
+        .rounded(px(12.))
+        .bg(if rewrite_on {
+            ca(0x6366f110)
+        } else {
+            ca(0xffffff05)
+        })
+        .border_1()
+        .border_color(if rewrite_on {
+            ca(0x818cf844)
+        } else {
+            ca(0xffffff12)
+        })
+        .flex()
+        .flex_col()
+        .gap(px(8.))
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.))
+                        .child(icon(
+                            "sparkles",
+                            13.,
+                            if rewrite_on { indigo } else { text_dim },
+                        ))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(text_hi)
+                                .child("Optional Rephrasing"),
+                        )
+                        .child(
+                            div()
+                                .px(px(6.))
+                                .py(px(1.))
+                                .rounded(px(999.))
+                                .bg(rewrite_status.1)
+                                .text_size(px(9.5))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rewrite_status.2)
+                                .child(rewrite_status.0),
+                        ),
+                )
+                .child(
+                    pill_switch("tog-rewrite", rewrite_on)
+                        .on_click(|_, _, cx| toggle_personal_rewrite_from_ui(cx)),
+                ),
+        )
+        .when(!rewrite_on, |card| {
+            card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(10.5))
+                            .text_color(text_dim)
+                            .truncate()
+                            .child("Off — direct GPU dictation without LLM editing"),
+                    )
+                    .child(
+                        div()
+                            .id("open-profile-setup")
+                            .px(px(9.))
+                            .py(px(4.))
+                            .rounded(px(7.))
+                            .bg(ca(0xffffff0c))
+                            .border_1()
+                            .border_color(ca(0xffffff18))
+                            .text_size(px(10.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_hi)
+                            .cursor_pointer()
+                            .hover(|s| s.bg(ca(0xffffff18)))
+                            .child(if has_profile {
+                                "Manage"
+                            } else {
+                                "Set up…"
+                            })
+                            .on_click(|_, window, cx| {
+                                close_settings_from_window(window, cx);
+                                cx.defer(crate::profile_setup::open);
+                            }),
+                    ),
+            )
+        })
+        .when(rewrite_on, |card| {
+            let next_model = rewrite_model.next();
+            let out_langs: [(&str, &str); 4] = [
+                ("", "Same"),
+                ("en", "EN"),
+                ("hi", "Hindi"),
+                ("pa", "Punjabi"),
+            ];
+            card.child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .id("cycle-rewrite-model")
+                            .flex_1()
+                            .min_w(px(0.))
+                            .h(px(26.))
+                            .px(px(8.))
+                            .rounded(px(7.))
+                            .bg(ca(0xffffff0a))
+                            .border_1()
+                            .border_color(ca(0xffffff16))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(ca(0xffffff16)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(5.))
+                                    .min_w(px(0.))
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(text_dim)
+                                            .child("LLM:"),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(11.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(text_hi)
+                                            .truncate()
+                                            .child(rewrite_model.short_label()),
+                                    )
+                                    .when(rewrite_model.is_indic_focused(), |d| {
+                                        d.child(
+                                            div()
+                                                .px(px(5.))
+                                                .py(px(0.5))
+                                                .rounded(px(999.))
+                                                .bg(ca(0xa78bfa24))
+                                                .text_size(px(9.))
+                                                .font_weight(FontWeight::SEMIBOLD)
+                                                .text_color(c(0xc4b5fd))
+                                                .child("Indic"),
+                                        )
+                                    }),
+                            )
+                            .child(icon("chevron-right", 12., text_dim))
+                            .on_click(move |_, _, cx| select_rewrite_model_from_ui(cx, next_model)),
+                    )
+                    .child(
+                        div()
+                            .id("open-profile-setup")
+                            .h(px(26.))
+                            .px(px(9.))
+                            .rounded(px(7.))
+                            .bg(indigo_bg)
+                            .border_1()
+                            .border_color(ca(0x818cf850))
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(ca(0x6366f140)))
+                            .child(icon("sliders-horizontal", 11., indigo))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(text_hi)
+                                    .child(if has_profile { "Profile" } else { "Set up" }),
+                            )
+                            .on_click(|_, window, cx| {
+                                close_settings_from_window(window, cx);
+                                cx.defer(crate::profile_setup::open);
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(6.))
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(text_mid)
+                            .child("Output"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(3.))
+                            .p(px(2.))
+                            .rounded(px(7.))
+                            .bg(ca(0xffffff08))
+                            .border_1()
+                            .border_color(ca(0xffffff12))
+                            .children(out_langs.into_iter().map(move |(code, label)| {
+                                let on = cfg.rewrite_language == code;
+                                div()
+                                    .id(ElementId::Name(SharedString::from(format!(
+                                        "rewrite-lang-{code}"
+                                    ))))
+                                    .px(px(7.5))
+                                    .py(px(2.))
+                                    .rounded(px(5.))
+                                    .bg(if on { indigo_bg } else { ca(0x00000000) })
+                                    .text_size(px(10.5))
+                                    .font_weight(if on {
+                                        FontWeight::SEMIBOLD
+                                    } else {
+                                        FontWeight::NORMAL
+                                    })
+                                    .text_color(if on { text_hi } else { text_mid })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(ca(0xffffff14)))
+                                    .child(label)
+                                    .on_click(move |_, _, cx| {
+                                        select_rewrite_language_from_ui(cx, code)
+                                    })
+                            })),
+                    ),
+            )
+        });
 
     // Quick bottom toggles
     let toggle_chip = |id: &'static str, label: &'static str, on: bool| {
@@ -725,7 +1105,7 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
             .h(px(30.))
             .px(px(8.))
             .rounded(px(8.))
-            .bg(if on { indigo_bg } else { ca(0xffffff07) })
+            .bg(if on { indigo_bg } else { card_bg })
             .border_1()
             .border_color(if on { ca(0x818cf855) } else { ca(0xffffff12) })
             .flex()
@@ -751,9 +1131,9 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
     };
 
     let toggles_row = div()
-        .pt(px(4.))
+        .pt(px(6.))
         .border_t_1()
-        .border_color(ca(0xffffff12))
+        .border_color(ca(0xffffff10))
         .flex()
         .flex_row()
         .gap(px(6.))
@@ -766,8 +1146,7 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                 .on_click(|_, _, cx| toggle_autostart_from_ui(cx)),
         )
         .child(
-            toggle_chip("tog-gpu", "GPU", cfg.use_gpu)
-                .on_click(|_, _, cx| toggle_gpu_from_ui(cx)),
+            toggle_chip("tog-gpu", "GPU", cfg.use_gpu).on_click(|_, _, cx| toggle_gpu_from_ui(cx)),
         );
 
     div()
@@ -780,10 +1159,13 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
         .border_color(border)
         .flex()
         .flex_col()
-        .gap(px(9.))
+        .gap(px(8.))
         .child(header)
+        .child(models_header)
         .child(models_list)
         .child(lang_row)
+        .child(rewrite_card)
+        .child(div().flex_1())
         .child(toggles_row)
         .into_any_element()
 }

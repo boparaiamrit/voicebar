@@ -1,10 +1,12 @@
 //! Persistent user settings, portable mode support, Windows startup toggle,
 //! and Hugging Face model manifests.
 
+use crate::personalization::RewriteProfile;
 use serde::{Deserialize, Serialize};
+use std::io;
 use std::path::{Path, PathBuf};
 
-const CURRENT_CONFIG_VERSION: u32 = 2;
+const CURRENT_CONFIG_VERSION: u32 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -69,7 +71,9 @@ impl ModelKind {
         match self {
             ModelKind::Nemotron35 => "Punctuation · removes um/uh · EN locked (40 langs) · 560ms",
             ModelKind::NemotronEn => "100% English-only · punctuation · zero Hindi drift · 560ms",
-            ModelKind::ParakeetUnifiedEn => "Newest unified English · punctuation · high accuracy · 560ms",
+            ModelKind::ParakeetUnifiedEn => {
+                "Newest unified English · punctuation · high accuracy · 560ms"
+            }
             ModelKind::ParakeetEou => "Instant 0.8s startup · ultra-fast 160ms chunks · English",
         }
     }
@@ -199,6 +203,97 @@ impl ModelKind {
     }
 }
 
+/// Optional local Ollama text-only model used when Personal Rewrite is turned ON.
+/// Strictly text-only models (no vision towers or tool overhead) for low-latency cleanup,
+/// including Sarvam AI's open-weight Indian-language models.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum RewriteModel {
+    /// Qwen 3 4B (text-only, no vision): fast English, Hindi & Hinglish cleanup (fits 8 GB GPU).
+    #[default]
+    Qwen3_4b,
+    /// Qwen 3 1.7B (text-only, no vision): ultra-fast low-VRAM cleanup (~1.4 GB).
+    Qwen3_1_7b,
+    /// Qwen 2.5 3B (text-only, no thinking overhead): instant Hinglish & Indian English cleanup (~1.9 GB).
+    Qwen25_3b,
+    /// Sarvam Translate 4B (Sarvam AI, text-only GGUF): 22 Indian languages translation (fits 8 GB GPU).
+    SarvamTranslate4b,
+    /// Sarvam M 24B (Sarvam AI, Apache 2.0, text-only): 11 Indian languages + Indian English (16 GB+ RAM/VRAM).
+    SarvamM24b,
+}
+
+impl RewriteModel {
+    pub const ALL: [RewriteModel; 5] = [
+        RewriteModel::Qwen3_4b,
+        RewriteModel::Qwen3_1_7b,
+        RewriteModel::Qwen25_3b,
+        RewriteModel::SarvamTranslate4b,
+        RewriteModel::SarvamM24b,
+    ];
+
+    pub fn ollama_tag(self) -> &'static str {
+        match self {
+            RewriteModel::Qwen3_4b => "qwen3:4b",
+            RewriteModel::Qwen3_1_7b => "qwen3:1.7b",
+            RewriteModel::Qwen25_3b => "qwen2.5:3b",
+            RewriteModel::SarvamTranslate4b => "hf.co/mradermacher/sarvam-translate-GGUF:Q4_K_M",
+            RewriteModel::SarvamM24b => "hf.co/bartowski/sarvamai_sarvam-m-GGUF:Q4_K_M",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            RewriteModel::Qwen3_4b => "Qwen 3 · 4B",
+            RewriteModel::Qwen3_1_7b => "Qwen 3 · 1.7B",
+            RewriteModel::Qwen25_3b => "Qwen 2.5 · 3B",
+            RewriteModel::SarvamTranslate4b => "Sarvam Translate · 4B",
+            RewriteModel::SarvamM24b => "Sarvam M · 24B",
+        }
+    }
+
+    pub fn short_label(self) -> &'static str {
+        match self {
+            RewriteModel::Qwen3_4b => "Qwen 3 4B",
+            RewriteModel::Qwen3_1_7b => "Qwen 3 1.7B",
+            RewriteModel::Qwen25_3b => "Qwen 2.5 3B",
+            RewriteModel::SarvamTranslate4b => "Sarvam 4B",
+            RewriteModel::SarvamM24b => "Sarvam M",
+        }
+    }
+
+    pub fn subtitle(self) -> &'static str {
+        match self {
+            RewriteModel::Qwen3_4b => "Text-only · fast English, Hindi & Hinglish · no vision overhead",
+            RewriteModel::Qwen3_1_7b => "Text-only · ultra-fast low-VRAM cleanup · 119 languages",
+            RewriteModel::Qwen25_3b => "Text-only · instant Hinglish & Indian English · zero thinking",
+            RewriteModel::SarvamTranslate4b => "Sarvam AI · text-only · 22 Indian languages translation · 8 GB GPU",
+            RewriteModel::SarvamM24b => "Sarvam AI · text-only · Indian languages & English · 16 GB+ RAM",
+        }
+    }
+
+    pub fn size_label(self) -> &'static str {
+        match self {
+            RewriteModel::Qwen3_4b => "~2.5 GB",
+            RewriteModel::Qwen3_1_7b => "~1.4 GB",
+            RewriteModel::Qwen25_3b => "~1.9 GB",
+            RewriteModel::SarvamTranslate4b => "~2.5 GB",
+            RewriteModel::SarvamM24b => "~14.5 GB",
+        }
+    }
+
+    pub fn is_indic_focused(self) -> bool {
+        matches!(
+            self,
+            RewriteModel::SarvamTranslate4b | RewriteModel::SarvamM24b | RewriteModel::Qwen25_3b
+        )
+    }
+
+    pub fn next(self) -> Self {
+        let idx = Self::ALL.iter().position(|&m| m == self).unwrap_or(0);
+        Self::ALL[(idx + 1) % Self::ALL.len()]
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -211,6 +306,16 @@ pub struct AppConfig {
     pub use_gpu: bool,
     #[serde(default = "default_auto_paste")]
     pub auto_paste: bool,
+    #[serde(default)]
+    pub personal_rewrite: bool,
+    #[serde(default)]
+    pub rewrite_model: RewriteModel,
+    #[serde(default)]
+    pub rewrite_language: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewrite_profile: Option<RewriteProfile>,
+    #[serde(default)]
+    pub legacy_rewrite: bool,
 }
 
 fn default_lang() -> String {
@@ -233,6 +338,11 @@ impl Default for AppConfig {
             language: default_lang(),
             use_gpu: true,
             auto_paste: true,
+            personal_rewrite: false,
+            rewrite_model: RewriteModel::Qwen3_4b,
+            rewrite_language: String::new(),
+            rewrite_profile: None,
+            legacy_rewrite: false,
         }
     }
 }
@@ -304,34 +414,88 @@ pub fn config_path() -> PathBuf {
 }
 
 impl AppConfig {
-    pub fn load() -> Self {
-        let p = config_path();
-        if let Ok(raw) = std::fs::read_to_string(&p) {
-            if let Ok(mut cfg) = serde_json::from_str::<AppConfig>(&raw) {
-                // Migrate v0/v1 configs off `"auto"` (which often mis-detects Indian English as Hindi).
-                if cfg.config_version < CURRENT_CONFIG_VERSION {
-                    if cfg.language == "auto" {
-                        cfg.language = "en-US".to_string();
-                    }
-                    cfg.config_version = CURRENT_CONFIG_VERSION;
-                    cfg.save();
-                }
-                return cfg;
-            }
+    pub fn has_valid_profile(&self) -> bool {
+        self.rewrite_profile
+            .as_ref()
+            .is_some_and(RewriteProfile::is_valid)
+    }
+
+    fn decode(raw: &str) -> serde_json::Result<Self> {
+        let mut config: Self = serde_json::from_str(raw)?;
+        if config.config_version < 2 && config.language == "auto" {
+            config.language = "en-US".to_string();
         }
-        Self::default()
+        // Discard invalid or manually corrupted profile data so UI and rewriter always agree.
+        if config
+            .rewrite_profile
+            .as_ref()
+            .is_some_and(|profile| !profile.is_valid())
+        {
+            config.rewrite_profile = None;
+        }
+        // Keep the old model for installations that had explicitly enabled it.
+        // Only the setup flow can replace it with a newly approved profile.
+        if config.config_version < 3 && config.personal_rewrite && config.rewrite_profile.is_none()
+        {
+            config.legacy_rewrite = true;
+        }
+        config.config_version = CURRENT_CONFIG_VERSION;
+        Ok(config)
+    }
+
+    pub fn activate_profile(&mut self, profile: RewriteProfile) -> io::Result<()> {
+        self.activate_at(profile, &config_path())
+    }
+
+    pub fn clear_profile(&mut self) -> io::Result<()> {
+        self.clear_at(&config_path())
+    }
+
+    fn clear_at(&mut self, path: &Path) -> io::Result<()> {
+        let mut cleared = self.clone();
+        cleared.rewrite_profile = None;
+        cleared.legacy_rewrite = false;
+        cleared.personal_rewrite = false;
+        cleared.save_to(path)?;
+        *self = cleared;
+        Ok(())
+    }
+
+    fn activate_at(&mut self, profile: RewriteProfile, path: &Path) -> io::Result<()> {
+        if !profile.is_valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid rewrite profile",
+            ));
+        }
+        let mut activated = self.clone();
+        activated.rewrite_profile = Some(profile);
+        activated.personal_rewrite = true;
+        activated.legacy_rewrite = false;
+        activated.save_to(path)?;
+        *self = activated;
+        Ok(())
+    }
+
+    pub fn load() -> Self {
+        std::fs::read_to_string(config_path())
+            .ok()
+            .and_then(|raw| Self::decode(&raw).ok())
+            .unwrap_or_default()
     }
 
     pub fn save(&self) {
-        let p = config_path();
-        if let Some(parent) = p.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let mut to_save = self.clone();
-        to_save.config_version = CURRENT_CONFIG_VERSION;
-        if let Ok(pretty) = serde_json::to_string_pretty(&to_save) {
-            let _ = std::fs::write(&p, pretty);
-        }
+        let _ = self.save_to(&config_path());
+    }
+
+    fn save_to(&self, path: &Path) -> io::Result<()> {
+        let parent = path.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        std::fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        serde_json::to_writer_pretty(temp.as_file_mut(), self)?;
+        temp.as_file().sync_all()?;
+        temp.persist(path).map_err(|failure| failure.error)?;
+        Ok(())
     }
 }
 
@@ -376,7 +540,9 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
             .map_err(|e| format!("Cannot resolve voicebar.exe path: {e}"))?;
         let val = format!("\"{}\"", exe.display());
         std::process::Command::new("reg")
-            .args(["add", key, "/v", "Voicebar", "/t", "REG_SZ", "/d", &val, "/f"])
+            .args([
+                "add", key, "/v", "Voicebar", "/t", "REG_SZ", "/d", &val, "/f",
+            ])
             .creation_flags(0x0800_0000)
             .status()
     } else {
@@ -440,12 +606,19 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 fn xdg_autostart_path() -> Option<PathBuf> {
     if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
         if !xdg.is_empty() {
-            return Some(PathBuf::from(xdg).join("autostart").join("voicebar.desktop"));
+            return Some(
+                PathBuf::from(xdg)
+                    .join("autostart")
+                    .join("voicebar.desktop"),
+            );
         }
     }
-    std::env::var("HOME")
-        .ok()
-        .map(|h| PathBuf::from(h).join(".config").join("autostart").join("voicebar.desktop"))
+    std::env::var("HOME").ok().map(|h| {
+        PathBuf::from(h)
+            .join(".config")
+            .join("autostart")
+            .join("voicebar.desktop")
+    })
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
@@ -477,6 +650,7 @@ pub fn set_autostart(enabled: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::personalization::SetupDraft;
 
     #[test]
     fn default_config_locks_english_and_auto_paste() {
@@ -485,7 +659,81 @@ mod tests {
         assert_eq!(cfg.language, "en-US");
         assert!(cfg.use_gpu);
         assert!(cfg.auto_paste);
+        assert!(!cfg.personal_rewrite);
+        assert!(cfg.rewrite_language.is_empty());
         assert_eq!(cfg.config_version, CURRENT_CONFIG_VERSION);
+    }
+
+    #[test]
+    fn older_configs_keep_personal_rewriting_off() {
+        let cfg: AppConfig =
+            serde_json::from_str(r#"{"language":"hi","auto_paste":false}"#).unwrap();
+        assert!(!cfg.personal_rewrite);
+        assert!(cfg.rewrite_language.is_empty());
+        assert_eq!(cfg.language, "hi");
+        assert!(!cfg.auto_paste);
+    }
+
+    #[test]
+    fn existing_explicit_opt_in_keeps_its_legacy_model_until_activation() {
+        let existing =
+            AppConfig::decode(r#"{"config_version":2,"personal_rewrite":true}"#).unwrap();
+        assert!(existing.legacy_rewrite);
+        assert!(existing.rewrite_profile.is_none());
+        assert!(!AppConfig::default().legacy_rewrite);
+    }
+
+    #[test]
+    fn activation_writes_the_reviewed_profile_and_enable_flag_together() {
+        let mut draft = SetupDraft::from_paste("Can you uh check?").unwrap();
+        draft.review(Some("Can you check?")).unwrap();
+        let profile = draft
+            .preview_inputs("First\n\nSecond\n\nThird")
+            .unwrap()
+            .profile;
+        let sandbox = tempfile::tempdir().unwrap();
+        let blocker = sandbox.path().join("not-a-directory");
+        std::fs::write(&blocker, "keep this").unwrap();
+        let mut config =
+            AppConfig::decode(r#"{"config_version":2,"personal_rewrite":true,"auto_paste":false}"#)
+                .unwrap();
+        assert!(
+            config
+                .activate_at(profile.clone(), &blocker.join("config.json"))
+                .is_err()
+        );
+        assert!(config.rewrite_profile.is_none());
+        assert_eq!(std::fs::read_to_string(&blocker).unwrap(), "keep this");
+
+        let path = sandbox.path().join("config.json");
+        std::fs::write(
+            &path,
+            r#"{"config_version":2,"personal_rewrite":true,"auto_paste":false}"#,
+        )
+        .unwrap();
+        config.activate_at(profile.clone(), &path).unwrap();
+        let saved = AppConfig::decode(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved.rewrite_profile, Some(profile));
+        assert!(saved.personal_rewrite);
+        assert!(!saved.legacy_rewrite);
+        assert!(!saved.auto_paste);
+
+        // Clearing removes the profile and disables personal rewriting cleanly.
+        config.clear_at(&path).unwrap();
+        let after_clear = AppConfig::decode(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(after_clear.rewrite_profile.is_none());
+        assert!(!after_clear.personal_rewrite);
+        assert!(!after_clear.legacy_rewrite);
+    }
+
+    #[test]
+    fn decode_discards_invalid_profile_and_defaults_to_text_only_rewrite_model() {
+        let decoded =
+            AppConfig::decode(r#"{"config_version":3,"rewrite_profile":{"examples":[]}}"#).unwrap();
+        assert!(decoded.rewrite_profile.is_none());
+        assert!(!decoded.has_valid_profile());
+        assert_eq!(decoded.rewrite_model, RewriteModel::Qwen3_4b);
+        assert_eq!(RewriteModel::ALL.len(), 5);
     }
 
     #[test]

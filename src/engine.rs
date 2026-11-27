@@ -45,6 +45,7 @@ pub enum EngineEvent {
     },
     TranscriptUpdate {
         text: String,
+        #[allow(dead_code)]
         last_chunk_ms: u32,
     },
     Finalizing,

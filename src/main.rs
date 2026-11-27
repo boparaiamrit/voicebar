@@ -12,22 +12,28 @@ mod audio;
 mod config;
 mod download;
 mod engine;
+mod history_import;
 mod hotkey;
 mod overlay;
+mod personalization;
+mod profile_setup;
+mod rewrite;
 mod tray;
 
 extern crate gpui_kit as gpui;
 
 use crate::audio::WAVEFORM_BARS;
 use crate::config::{
-    AppConfig, ModelKind, is_autostart_enabled, is_model_ready, models_root, open_folder,
-    set_autostart,
+    AppConfig, ModelKind, RewriteModel, is_autostart_enabled, is_model_ready, models_root,
+    open_folder, set_autostart,
 };
 use crate::engine::{EngineCommand, EngineEvent, EngineHandle};
 use crate::overlay::{PILL_HEIGHT, PILL_WIDTH, SETTINGS_HEIGHT, SETTINGS_WIDTH};
 use crate::tray::TrayMood;
+use gpui_kit::component::{Theme, ThemeMode};
 use gpui_kit::*;
 use std::path::PathBuf;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const INSTANCE_PORT: u16 = 7981;
@@ -62,6 +68,9 @@ pub struct VoiceState {
     pub phase: Phase,
     pub live_text: String,
     pub last_transcript: String,
+    pub rewrite_fell_back: bool,
+    pending_rewrite: Option<PendingRewrite>,
+    dictation_config: Option<AppConfig>,
     pub target_hwnd: isize,
     pub waveform: [f32; WAVEFORM_BARS],
     pub auto_hide_at: Option<Instant>,
@@ -73,6 +82,17 @@ pub struct VoiceState {
 }
 
 impl Global for VoiceState {}
+
+struct PendingRewrite {
+    result: Receiver<Option<String>>,
+    deadline: Instant,
+}
+
+impl VoiceState {
+    pub fn is_rewriting(&self) -> bool {
+        self.pending_rewrite.is_some()
+    }
+}
 
 struct EngineGlobal(EngineHandle);
 impl Global for EngineGlobal {}
@@ -202,7 +222,10 @@ fn ensure_settings_open(cx: &mut App) {
 fn close_settings_external(cx: &mut App) {
     cx.global_mut::<VoiceState>().settings_open = false;
     if let Some(handle) = cx.global::<SettingsWindow>().0 {
-        if handle.update(cx, |_, window, _| window.remove_window()).is_ok() {
+        if handle
+            .update(cx, |_, window, _| window.remove_window())
+            .is_ok()
+        {
             cx.global_mut::<SettingsWindow>().0 = None;
         } else {
             // Defer removal so we never lose track of a temporarily leased window.
@@ -239,10 +262,15 @@ pub fn dismiss_overlay(cx: &mut App) {
     {
         let st = cx.global_mut::<VoiceState>();
         st.auto_hide_at = None;
+        st.pending_rewrite = None;
+        st.dictation_config = None;
         st.phase = Phase::Idle;
     }
     if let Some(handle) = cx.global::<OverlayWindow>().0 {
-        if handle.update(cx, |_, window, _| window.remove_window()).is_ok() {
+        if handle
+            .update(cx, |_, window, _| window.remove_window())
+            .is_ok()
+        {
             cx.global_mut::<OverlayWindow>().0 = None;
         } else {
             cx.defer(|cx| {
@@ -261,6 +289,8 @@ pub fn dismiss_overlay_from_window(window: &mut Window, cx: &mut App) {
     {
         let st = cx.global_mut::<VoiceState>();
         st.auto_hide_at = None;
+        st.pending_rewrite = None;
+        st.dictation_config = None;
         st.phase = Phase::Idle;
     }
     cx.global_mut::<OverlayWindow>().0 = None;
@@ -312,6 +342,9 @@ pub fn select_model_from_settings(window: &mut Window, cx: &mut App, kind: Model
         };
         st.config.clone()
     };
+    if was_active {
+        cx.global_mut::<VoiceState>().dictation_config = Some(cfg.clone());
+    }
     ensure_overlay_open(cx);
     sync_tray(cx);
     let tx = &cx.global::<EngineGlobal>().0.tx;
@@ -335,11 +368,19 @@ pub fn select_language_from_settings(cx: &mut App, code: &str) {
     };
     sync_tray(cx);
     let was_listening = matches!(cx.global::<VoiceState>().phase, Phase::Listening { .. });
-    let tx = &cx.global::<EngineGlobal>().0.tx;
     if was_listening {
+        {
+            let st = cx.global_mut::<VoiceState>();
+            st.dictation_config = Some(cfg.clone());
+            st.phase = Phase::Loading {
+                stage: "Switching language…".into(),
+            };
+        }
+        let tx = &cx.global::<EngineGlobal>().0.tx;
         let _ = tx.send(EngineCommand::CancelDictation);
         let _ = tx.send(EngineCommand::StartDictation(cfg));
     } else if cx.global::<VoiceState>().model_loaded {
+        let tx = &cx.global::<EngineGlobal>().0.tx;
         let _ = tx.send(EngineCommand::Prepare(cfg));
     }
     cx.refresh_windows();
@@ -351,6 +392,60 @@ pub fn toggle_auto_paste_from_ui(cx: &mut App) {
     st.config.save();
     sync_tray(cx);
     cx.refresh_windows();
+}
+
+pub fn toggle_personal_rewrite_from_ui(cx: &mut App) {
+    let st = cx.global_mut::<VoiceState>();
+    st.config.personal_rewrite = !st.config.personal_rewrite;
+    st.config.save();
+    if st.pending_rewrite.take().is_some() {
+        let original = st.last_transcript.clone();
+        deliver_transcript(cx, original, false, true);
+    }
+    sync_tray(cx);
+    cx.refresh_windows();
+}
+
+pub fn select_rewrite_model_from_ui(cx: &mut App, model: RewriteModel) {
+    let st = cx.global_mut::<VoiceState>();
+    if st.config.rewrite_model != model {
+        st.config.rewrite_model = model;
+        st.config.save();
+        sync_tray(cx);
+        cx.refresh_windows();
+    }
+}
+
+pub fn select_rewrite_language_from_ui(cx: &mut App, code: &str) {
+    let st = cx.global_mut::<VoiceState>();
+    if rewrite::valid_language(code) && st.config.rewrite_language != code {
+        st.config.rewrite_language = code.to_owned();
+        st.config.save();
+        cx.refresh_windows();
+    }
+}
+
+pub fn activate_rewrite_profile(
+    cx: &mut App,
+    profile: personalization::RewriteProfile,
+) -> Result<(), &'static str> {
+    cx.global_mut::<VoiceState>()
+        .config
+        .activate_profile(profile)
+        .map_err(|_| "Voicebar could not save the profile. Check access to its settings folder and try again.")?;
+    sync_tray(cx);
+    cx.refresh_windows();
+    Ok(())
+}
+
+pub fn clear_rewrite_profile(cx: &mut App) -> Result<(), &'static str> {
+    cx.global_mut::<VoiceState>()
+        .config
+        .clear_profile()
+        .map_err(|_| "Voicebar could not clear the saved profile. Check access to its settings folder.")?;
+    sync_tray(cx);
+    cx.refresh_windows();
+    Ok(())
 }
 
 pub fn toggle_autostart_from_ui(cx: &mut App) {
@@ -420,13 +515,18 @@ pub fn toggle_dictation(cx: &mut App) {
                 .send(EngineCommand::CancelDictation);
             dismiss_overlay(cx);
         }
-        Phase::Finalizing => {}
+        Phase::Finalizing => {
+            if cx.global::<VoiceState>().is_rewriting() {
+                dismiss_overlay(cx);
+            }
+        }
         Phase::Idle | Phase::Copied { .. } | Phase::Error(_) => {
             let cfg = cx.global::<VoiceState>().config.clone();
             let fg_hwnd = hotkey::capture_foreground_hwnd();
             {
                 let st = cx.global_mut::<VoiceState>();
                 st.live_text.clear();
+                st.dictation_config = Some(cfg.clone());
                 st.target_hwnd = fg_hwnd;
                 st.auto_hide_at = None;
                 st.waveform = [0.08; WAVEFORM_BARS];
@@ -471,6 +571,9 @@ fn sync_tray(cx: &mut App) {
             TrayMood::Ready
         };
         let tip = match mood {
+            TrayMood::Recording if st.config.personal_rewrite => {
+                "Voicebar · Listening (F1 to rewrite & copy)".to_string()
+            }
             TrayMood::Recording => "Voicebar · Listening (F1 to stop & paste)".to_string(),
             TrayMood::Warming => format!(
                 "Voicebar · Preloading {} on GPU…",
@@ -487,6 +590,78 @@ fn sync_tray(cx: &mut App) {
     if let Some(tray) = cx.global_mut::<TrayGlobal>().0.as_mut() {
         tray.sync(&cfg, autostart, mood, &tip);
     }
+}
+
+fn deliver_transcript(cx: &mut App, text: String, auto_paste: bool, rewrite_fell_back: bool) {
+    let pasted = auto_paste && !text.is_empty();
+    if !text.is_empty() {
+        copy_to_clipboard(cx, &text);
+        if pasted {
+            hotkey::paste_ctrl_v_async(cx.global::<VoiceState>().target_hwnd);
+        }
+    }
+    let st = cx.global_mut::<VoiceState>();
+    st.live_text = text.clone();
+    st.phase = Phase::Copied { text, pasted };
+    st.rewrite_fell_back = rewrite_fell_back;
+    let display_ms = if rewrite_fell_back { 2500 } else { 850 };
+    st.auto_hide_at = Some(Instant::now() + Duration::from_millis(display_ms));
+    sync_tray(cx);
+}
+
+fn finish_dictation(cx: &mut App, text: String) {
+    let st = cx.global_mut::<VoiceState>();
+    if !matches!(st.phase, Phase::Finalizing) || st.is_rewriting() {
+        return;
+    }
+    // A profile activated while the microphone is open applies on the next recording.
+    let config = st
+        .dictation_config
+        .take()
+        .unwrap_or_else(|| st.config.clone());
+    if !text.is_empty() {
+        // "Copy Last Transcript" always recovers what the recognizer heard.
+        st.last_transcript = text.clone();
+        if config.personal_rewrite {
+            if let Some(result) = rewrite::start(
+                &text,
+                &config.rewrite_language,
+                rewrite::RewriteMode::configured(&config),
+            ) {
+                st.pending_rewrite = Some(PendingRewrite {
+                    result,
+                    deadline: Instant::now() + rewrite::TIMEOUT,
+                });
+                return;
+            }
+            deliver_transcript(cx, text, false, true);
+            return;
+        }
+    }
+    let auto_paste = config.auto_paste;
+    deliver_transcript(cx, text, auto_paste, false);
+}
+
+fn poll_rewrite(cx: &mut App) {
+    let st = cx.global_mut::<VoiceState>();
+    let Some(pending) = st.pending_rewrite.as_ref() else {
+        return;
+    };
+    if !matches!(st.phase, Phase::Finalizing) {
+        st.pending_rewrite = None;
+        return;
+    }
+    let result = match pending.result.try_recv() {
+        Ok(text) => text,
+        Err(TryRecvError::Empty) if Instant::now() < pending.deadline => return,
+        Err(_) => None,
+    };
+    st.pending_rewrite = None;
+    let fell_back = result.is_none();
+    let text = result.unwrap_or_else(|| st.last_transcript.clone());
+    // The user can change apps while the model runs. Leave pasting to them.
+    deliver_transcript(cx, text, false, fell_back);
+    cx.refresh_windows();
 }
 
 fn handle_engine_event(cx: &mut App, ev: EngineEvent) {
@@ -547,30 +722,13 @@ fn handle_engine_event(cx: &mut App, ev: EngineEvent) {
             cx.global_mut::<VoiceState>().live_text = text;
         }
         EngineEvent::Finalizing => {
-            cx.global_mut::<VoiceState>().phase = Phase::Finalizing;
+            // Ignore notifications for dictations dismissed before the worker flushed.
+            if matches!(cx.global::<VoiceState>().phase, Phase::Listening { .. }) {
+                cx.global_mut::<VoiceState>().phase = Phase::Finalizing;
+            }
         }
         EngineEvent::Finished { text } => {
-            let (auto_paste, fallback_hwnd) = {
-                let st = cx.global::<VoiceState>();
-                (st.config.auto_paste, st.target_hwnd)
-            };
-            let pasted = if !text.is_empty() {
-                copy_to_clipboard(cx, &text);
-                cx.global_mut::<VoiceState>().last_transcript = text.clone();
-                if auto_paste {
-                    hotkey::paste_ctrl_v_async(fallback_hwnd);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            let st = cx.global_mut::<VoiceState>();
-            st.live_text = text.clone();
-            st.phase = Phase::Copied { text, pasted };
-            st.auto_hide_at = Some(Instant::now() + Duration::from_millis(850));
-            sync_tray(cx);
+            finish_dictation(cx, text);
         }
         EngineEvent::Cancelled => {
             if !matches!(
@@ -596,11 +754,13 @@ fn handle_tray_action(cx: &mut App, action: tray::TrayAction) {
     match action {
         ToggleDictation => toggle_dictation(cx),
         OpenSettings => toggle_settings_popover(cx),
+        OpenProfileSetup => profile_setup::open(cx),
         CopyLast => {
             let last = cx.global::<VoiceState>().last_transcript.clone();
             if !last.is_empty() {
                 copy_to_clipboard(cx, &last);
                 let st = cx.global_mut::<VoiceState>();
+                st.rewrite_fell_back = false;
                 st.phase = Phase::Copied {
                     text: last,
                     pasted: false,
@@ -610,6 +770,7 @@ fn handle_tray_action(cx: &mut App, action: tray::TrayAction) {
                 cx.refresh_windows();
             }
         }
+        TogglePersonalRewrite => toggle_personal_rewrite_from_ui(cx),
         ToggleAutoPaste => toggle_auto_paste_from_ui(cx),
         ToggleAutostart => toggle_autostart_from_ui(cx),
         ToggleGpu => toggle_gpu_from_ui(cx),
@@ -673,6 +834,7 @@ fn start_loop(cx: &mut App) {
                 for ev in events {
                     handle_engine_event(cx, ev);
                 }
+                poll_rewrite(cx);
 
                 let is_listening =
                     matches!(cx.global::<VoiceState>().phase, Phase::Listening { .. });
@@ -714,6 +876,10 @@ struct CliArgs {
     model_override: Option<ModelKind>,
     lang_override: Option<String>,
     force_cpu: bool,
+    personal_rewrite: bool,
+    rewrite_model: Option<RewriteModel>,
+    rewrite_language: Option<String>,
+    rewrite_stdin: bool,
     show_on_start: bool,
 }
 
@@ -725,6 +891,10 @@ fn parse_args() -> CliArgs {
         model_override: None,
         lang_override: None,
         force_cpu: false,
+        personal_rewrite: false,
+        rewrite_model: None,
+        rewrite_language: None,
+        rewrite_stdin: false,
         show_on_start: false,
     };
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -734,11 +904,41 @@ fn parse_args() -> CliArgs {
             "--version" | "-V" | "version" => out.print_version = true,
             "--download" => out.download_only = true,
             "--cpu" => out.force_cpu = true,
+            "--personal-rewrite" => out.personal_rewrite = true,
+            "--rewrite-stdin" => out.rewrite_stdin = true,
+            "--rewrite-model" if i + 1 < args.len() => {
+                i += 1;
+                match args[i].to_lowercase().as_str() {
+                    "qwen3" | "qwen3-4b" | "4b" => out.rewrite_model = Some(RewriteModel::Qwen3_4b),
+                    "qwen3-1.7b" | "1.7b" | "fast" => {
+                        out.rewrite_model = Some(RewriteModel::Qwen3_1_7b)
+                    }
+                    "qwen2.5" | "qwen2.5-3b" | "3b" => {
+                        out.rewrite_model = Some(RewriteModel::Qwen25_3b)
+                    }
+                    "sarvam-translate" | "sarvam-4b" => {
+                        out.rewrite_model = Some(RewriteModel::SarvamTranslate4b)
+                    }
+                    "sarvam-m" | "sarvam" => out.rewrite_model = Some(RewriteModel::SarvamM24b),
+                    _ => {}
+                }
+            }
+            "--rewrite-language" => {
+                i += 1;
+                let code = args.get(i).filter(|code| rewrite::valid_language(code));
+                let Some(code) = code else {
+                    eprintln!("--rewrite-language expects a language tag such as hi or en-US.");
+                    std::process::exit(2);
+                };
+                out.rewrite_language = Some(code.clone());
+            }
             "--show" => out.show_on_start = true,
             "--model" if i + 1 < args.len() => {
                 i += 1;
                 match args[i].to_lowercase().as_str() {
-                    "eou" | "parakeet" | "120m" => out.model_override = Some(ModelKind::ParakeetEou),
+                    "eou" | "parakeet" | "120m" => {
+                        out.model_override = Some(ModelKind::ParakeetEou)
+                    }
                     "nemotron-en" | "en" => out.model_override = Some(ModelKind::NemotronEn),
                     "unified" | "parakeet-unified" => {
                         out.model_override = Some(ModelKind::ParakeetUnifiedEn)
@@ -764,6 +964,46 @@ fn parse_args() -> CliArgs {
     out
 }
 
+fn apply_dark_theme(cx: &mut App) {
+    Theme::change(ThemeMode::Dark, None, cx);
+    let th = cx.global_mut::<Theme>();
+    th.font_family = overlay::ui_font().into();
+    th.font_size = px(14.);
+    th.radius = px(10.);
+    let c = &mut th.colors;
+    c.background = rgb(0x0d0d14).into();
+    c.foreground = rgb(0xf4f4f6).into();
+    c.border = rgba(0xffffff1a).into();
+    c.input = rgba(0xffffff1e).into();
+    c.muted = rgb(0x161622).into();
+    c.muted_foreground = rgb(0x9ca3af).into();
+    c.secondary = rgb(0x1a1a27).into();
+    c.secondary_hover = rgb(0x232334).into();
+    c.secondary_active = rgb(0x28283c).into();
+    c.secondary_foreground = rgb(0xe4e4eb).into();
+    c.primary = rgb(0x6366f1).into();
+    c.primary_hover = rgb(0x818cf8).into();
+    c.primary_active = rgb(0x4f46e5).into();
+    c.primary_foreground = rgb(0xffffff).into();
+    c.button = rgb(0x1a1a27).into();
+    c.button_hover = rgb(0x242436).into();
+    c.button_active = rgb(0x2c2c42).into();
+    c.button_foreground = rgb(0xe4e4eb).into();
+    c.button_primary = rgb(0x6366f1).into();
+    c.button_primary_hover = rgb(0x818cf8).into();
+    c.button_primary_active = rgb(0x4f46e5).into();
+    c.button_primary_foreground = rgb(0xffffff).into();
+    c.ring = rgb(0x818cf8).into();
+    c.caret = rgb(0xa5b4fc).into();
+    c.selection = rgba(0x6366f144).into();
+    c.accent = rgb(0x1e1e2e).into();
+    c.accent_foreground = rgb(0xf4f4f6).into();
+    c.popover = rgb(0x151520).into();
+    c.popover_foreground = rgb(0xf4f4f6).into();
+    c.title_bar = rgb(0x101018).into();
+    c.title_bar_border = rgba(0xffffff14).into();
+}
+
 fn main() {
     let cli = parse_args();
     if cli.print_version {
@@ -772,6 +1012,25 @@ fn main() {
     }
 
     let mut cfg = AppConfig::load();
+    if let Some(model) = cli.rewrite_model {
+        cfg.rewrite_model = model;
+    }
+    if let Some(language) = cli.rewrite_language {
+        cfg.rewrite_language = language;
+    }
+    if cli.personal_rewrite {
+        cfg.personal_rewrite = true;
+    }
+    if cli.rewrite_stdin {
+        if let Err(message) = rewrite::run_stdin(
+            &cfg.rewrite_language,
+            rewrite::RewriteMode::configured(&cfg),
+        ) {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if let Some(m) = cli.model_override {
         cfg.model = m;
     }
@@ -852,6 +1111,7 @@ fn main() {
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
+            apply_dark_theme(cx);
             cx.set_quit_mode(QuitMode::Explicit);
 
             // Register global F1 hotkey on the main thread (required by macOS Carbon/AppKit).
@@ -862,6 +1122,9 @@ fn main() {
                 phase: Phase::Idle,
                 live_text: String::new(),
                 last_transcript: String::new(),
+                rewrite_fell_back: false,
+                pending_rewrite: None,
+                dictation_config: None,
                 target_hwnd: 0,
                 waveform: [0.08; WAVEFORM_BARS],
                 auto_hide_at: None,
@@ -875,6 +1138,7 @@ fn main() {
             cx.set_global(TrayGlobal(tray));
             cx.set_global(OverlayWindow(None));
             cx.set_global(SettingsWindow(None));
+            profile_setup::init(cx);
             sync_tray(cx);
             start_loop(cx);
 

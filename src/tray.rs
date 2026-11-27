@@ -2,7 +2,9 @@
 //! and full menu for Voicebar.
 
 use crate::config::{AppConfig, ModelKind};
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
+use tray_icon::menu::{
+    CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu,
+};
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -15,9 +17,11 @@ pub enum TrayMood {
 pub enum TrayAction {
     ToggleDictation,
     OpenSettings,
+    OpenProfileSetup,
     CopyLast,
     SelectModel(ModelKind),
     SelectLanguage(String),
+    TogglePersonalRewrite,
     ToggleAutoPaste,
     ToggleAutostart,
     ToggleGpu,
@@ -25,19 +29,33 @@ pub enum TrayAction {
     Quit,
 }
 
+const TRAY_LANGUAGES: &[(&str, &str)] = &[
+    ("en-US", "English (en-US)"),
+    ("en-GB", "English · India / UK (en-GB)"),
+    ("hi-IN", "Hindi (hi-IN)"),
+    ("bn-IN", "Bengali (bn-IN)"),
+    ("ta-IN", "Tamil (ta-IN)"),
+    ("te-IN", "Telugu (te-IN)"),
+    ("mr-IN", "Marathi (mr-IN)"),
+    ("gu-IN", "Gujarati (gu-IN)"),
+    ("kn-IN", "Kannada (kn-IN)"),
+    ("ml-IN", "Malayalam (ml-IN)"),
+    ("auto", "Auto Detect"),
+];
+
 pub struct Tray {
     icon: TrayIcon,
     last_mood: Option<TrayMood>,
     toggle: MenuId,
     open_settings: MenuId,
+    open_profile_setup: MenuId,
     copy_last: MenuId,
     model_nemotron35: CheckMenuItem,
     model_nemotron_en: CheckMenuItem,
     model_unified_en: CheckMenuItem,
     model_eou: CheckMenuItem,
-    lang_en: CheckMenuItem,
-    lang_hi: CheckMenuItem,
-    lang_auto: CheckMenuItem,
+    lang_items: Vec<(&'static str, CheckMenuItem)>,
+    personal_rewrite: CheckMenuItem,
     auto_paste: CheckMenuItem,
     autostart: CheckMenuItem,
     use_gpu: CheckMenuItem,
@@ -105,11 +123,12 @@ impl Tray {
         let menu = Menu::new();
         let toggle = MenuItem::new("Start / Stop Dictation  (F1)", true, None);
         let open_settings = MenuItem::new("Models & Settings…", true, None);
+        let open_profile_setup = MenuItem::new("Personal Rewrite Profile…", true, None);
         let copy_last = MenuItem::new("Copy Last Transcript", true, None);
 
-        let model_menu = Submenu::new("Model", true);
+        let model_menu = Submenu::new("Speech Model (GPU)", true);
         let model_nemotron35 = CheckMenuItem::new(
-            "Nemotron 3.5 · 0.6B  (Punctuation · Clean Fillers · EN/40 langs)",
+            "Nemotron 3.5 · 0.6B  (EN + Indian Languages · Punctuation)",
             true,
             cfg.model == ModelKind::Nemotron35,
             None,
@@ -139,11 +158,13 @@ impl Tray {
             &model_eou,
         ]);
 
-        let lang_menu = Submenu::new("Language (Nemotron 3.5)", true);
-        let lang_en = CheckMenuItem::new("English (en-US)", true, cfg.language == "en-US", None);
-        let lang_hi = CheckMenuItem::new("Hindi (hi-IN)", true, cfg.language == "hi-IN", None);
-        let lang_auto = CheckMenuItem::new("Auto Detect", true, cfg.language == "auto", None);
-        let _ = lang_menu.append_items(&[&lang_en, &lang_hi, &lang_auto]);
+        let lang_menu = Submenu::new("Spoken Language (Nemotron 3.5)", true);
+        let mut lang_items = Vec::with_capacity(TRAY_LANGUAGES.len());
+        for &(code, label) in TRAY_LANGUAGES {
+            let item = CheckMenuItem::new(label, true, cfg.language == code, None);
+            let _ = lang_menu.append(&item);
+            lang_items.push((code, item));
+        }
 
         let paste_label = if cfg!(target_os = "macos") {
             "Auto-Paste into Input (⌘V)"
@@ -155,13 +176,15 @@ impl Tray {
         } else {
             "GPU Acceleration (Vulkan)"
         };
-        let auto_paste = CheckMenuItem::new(paste_label, true, cfg.auto_paste, None);
-        let autostart = CheckMenuItem::new(
-            "Start at Sign-In (Preload GPU)",
+        let personal_rewrite = CheckMenuItem::new(
+            "Optional Rephrasing (Local Ollama)",
             true,
-            autostart_on,
+            cfg.personal_rewrite,
             None,
         );
+        let auto_paste = CheckMenuItem::new(paste_label, true, cfg.auto_paste, None);
+        let autostart =
+            CheckMenuItem::new("Start at Sign-In (Preload GPU)", true, autostart_on, None);
         let use_gpu = CheckMenuItem::new(gpu_label, true, cfg.use_gpu, None);
         let open_models = MenuItem::new("Open Models Folder", true, None);
         let quit = MenuItem::new("Quit Voicebar", true, None);
@@ -169,8 +192,10 @@ impl Tray {
         let _ = menu.append_items(&[
             &toggle,
             &open_settings,
+            &open_profile_setup,
             &copy_last,
             &PredefinedMenuItem::separator(),
+            &personal_rewrite,
             &auto_paste,
             &autostart,
             &PredefinedMenuItem::separator(),
@@ -196,14 +221,14 @@ impl Tray {
             last_mood: Some(TrayMood::Warming),
             toggle: toggle.id().clone(),
             open_settings: open_settings.id().clone(),
+            open_profile_setup: open_profile_setup.id().clone(),
             copy_last: copy_last.id().clone(),
             model_nemotron35,
             model_nemotron_en,
             model_unified_en,
             model_eou,
-            lang_en,
-            lang_hi,
-            lang_auto,
+            lang_items,
+            personal_rewrite,
             auto_paste,
             autostart,
             use_gpu,
@@ -221,9 +246,10 @@ impl Tray {
             .set_checked(cfg.model == ModelKind::ParakeetUnifiedEn);
         self.model_eou
             .set_checked(cfg.model == ModelKind::ParakeetEou);
-        self.lang_en.set_checked(cfg.language == "en-US");
-        self.lang_hi.set_checked(cfg.language == "hi-IN");
-        self.lang_auto.set_checked(cfg.language == "auto");
+        for (code, item) in &self.lang_items {
+            item.set_checked(cfg.language == *code);
+        }
+        self.personal_rewrite.set_checked(cfg.personal_rewrite);
         self.auto_paste.set_checked(cfg.auto_paste);
         self.autostart.set_checked(autostart_on);
         self.use_gpu.set_checked(cfg.use_gpu);
@@ -252,6 +278,8 @@ impl Tray {
                 out.push(TrayAction::ToggleDictation);
             } else if id == self.open_settings {
                 out.push(TrayAction::OpenSettings);
+            } else if id == self.open_profile_setup {
+                out.push(TrayAction::OpenProfileSetup);
             } else if id == self.copy_last {
                 out.push(TrayAction::CopyLast);
             } else if id == *self.model_nemotron35.id() {
@@ -262,12 +290,11 @@ impl Tray {
                 out.push(TrayAction::SelectModel(ModelKind::ParakeetUnifiedEn));
             } else if id == *self.model_eou.id() {
                 out.push(TrayAction::SelectModel(ModelKind::ParakeetEou));
-            } else if id == *self.lang_en.id() {
-                out.push(TrayAction::SelectLanguage("en-US".into()));
-            } else if id == *self.lang_hi.id() {
-                out.push(TrayAction::SelectLanguage("hi-IN".into()));
-            } else if id == *self.lang_auto.id() {
-                out.push(TrayAction::SelectLanguage("auto".into()));
+            } else if let Some((code, _)) = self.lang_items.iter().find(|(_, item)| id == *item.id())
+            {
+                out.push(TrayAction::SelectLanguage((*code).to_string()));
+            } else if id == *self.personal_rewrite.id() {
+                out.push(TrayAction::TogglePersonalRewrite);
             } else if id == *self.auto_paste.id() {
                 out.push(TrayAction::ToggleAutoPaste);
             } else if id == *self.autostart.id() {

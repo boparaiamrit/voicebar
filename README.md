@@ -132,6 +132,60 @@ By default, settings and downloaded models live in:
 To run fully portable (for example on a USB drive or synced folder), create an empty `portable.txt`
 file or a `voicebar-data/` directory next to the `voicebar` binary.
 
+## Personal rewriting (optional)
+
+Rephrasing is **100% optional and OFF by default** — switch it ON or OFF anytime from **Models &
+Settings**, the system tray, or the **Personal Rewrite Studio** header. When OFF, Voicebar pastes
+raw GPU speech-to-text directly with zero LLM latency.
+
+When ON, Voicebar uses a **pure text-only local Ollama model** (no vision towers or tool bloat):
+
+| Rewrite Model | Size | Highlights |
+| --- | --- | --- |
+| **Qwen 3 · 4B** *(default)* | ~2.5 GB | Pure text-only, fast English, Hindi & Hinglish cleanup (fits 8 GB GPU) |
+| **Qwen 3 · 1.7B** | ~1.4 GB | Pure text-only, ultra-fast low-VRAM cleanup across 119 languages |
+| **Qwen 2.5 · 3B** | ~1.9 GB | Pure text-only, instant Hinglish & Indian English cleanup, zero thinking overhead |
+| **Sarvam Translate · 4B** | ~2.5 GB | Sarvam AI text-only GGUF across 22 Indian languages (fits 8 GB GPU) |
+| **Sarvam M · 24B** | ~14.5 GB | Sarvam AI Apache-2.0 text-only Indian languages & English (16 GB+ RAM / Apple Silicon) |
+
+Open **Personal Rewrite Profile…** from the tray or **Set up…** from Models & Settings:
+
+1. Choose your preferred local text-only Ollama model (downloads stream with live progress and can be
+   cancelled anytime), then paste transcripts separated by a blank line or select local coding
+   assistants to scan read-only (**Select all** checks detected sources; **Import selected** confirms
+   the read and shows coverage).
+2. For up to five examples, choose **Light cleanup**, **Natural rephrase**, **Keep original**, or
+   **Write my own** (or skip). Approved examples preserve uncertainty (`maybe`, `might`, `could`),
+   negation, deadlines, and natural Hinglish/Indian English phrasing.
+3. Paste three new dictations outside your samples, compare Standard vs. Personal rewrites
+   side-by-side, and click **Activate personal profile**. You can inspect or clear your active profile
+   anytime from the Studio dashboard.
+
+**Speech recognition for India:** `Nemotron 3.5 · 0.6B` also supports 10 Indian language/accent
+presets natively on GPU (`en-US`, `en-GB`, `hi-IN`, `bn-IN`, `ta-IN`, `te-IN`, `mr-IN`, `gu-IN`,
+`kn-IN`, `ml-IN`) right from **Models & Settings** and the system tray.
+
+Press `F1` to finish and review the rewrite on your clipboard before pasting. **Copy Last Transcript**
+in the tray always recovers the raw speech recognition. Long inputs (over 4,096 UTF-8 bytes),
+unavailable models, and timed-out rewrites fall back cleanly to the original transcript.
+
+History import supports readable local Codex, Claude Code, Gemini CLI, Antigravity, OpenCode,
+Cursor, Grok CLI, Cline, and Copilot/VS Code histories. Assistant replies, tool outputs, subagents,
+and bare slash commands are excluded.
+
+To test the rewriter from the CLI without a microphone:
+
+```powershell
+"Maybe we can ship Friday, no wait Thursday?" | voicebar --rewrite-stdin
+"Please keep the ticket open." | voicebar --rewrite-stdin --rewrite-language hi --rewrite-model sarvam-translate
+```
+
+### Legacy local profiles
+
+An existing enabled profile built with the `voicebar-personal` model continues to use it until
+you activate a new profile. The legacy script helpers (`tools/voicebar_history.py`,
+`tools/voicebar_personal.py`) remain available if you prefer building an Ollama `Modelfile` manually.
+
 ## CLI helpers
 
 ```powershell
@@ -146,8 +200,9 @@ voicebar --cpu                         # force CPU Burn backend
 
 - **100% offline inference.** Audio is captured directly from your OS microphone (`cpal`) and
   processed strictly on your local GPU/CPU. Zero audio bytes ever leave your machine.
-- **Network used only for model downloads.** Weights are fetched directly over HTTPS from Hugging
-  Face (`altunenes/parakeet-rs`) with atomic `.part` writes.
+- **Local processing.** ASR weights are fetched over HTTPS from Hugging Face
+  (`altunenes/parakeet-rs`) with atomic `.part` writes. Optional Personal Rewrite sends the
+  final transcript to Ollama at `127.0.0.1:11434` using a local model installed separately.
 - **Single-instance local lock.** Binds only to `127.0.0.1:7981` to toggle an existing instance.
 
 ## Build from source
@@ -167,17 +222,21 @@ cargo build --release
 
 ```text
 src/
-  main.rs       single-instance lifecycle, two-window pill + settings orchestration, CLI
-  overlay.rs    Dynamic Island floating capsule and Models & Settings popover (GPUI Kit)
-  engine.rs     dedicated GPU streaming ASR worker (parakeet-rs on Burn Vulkan / Metal)
-  audio.rs      WASAPI / CoreAudio / ALSA mic capture + 16 kHz linear resampler + waveform
-  hotkey.rs     global F1 listener, auto-paste (SendInput / osascript / xdotool), Windows DWM border strip
-  tray.rs       system tray / menu bar icon (amber/indigo/crimson) and menu
-  config.rs     model manifests, portable data paths, sign-in autostart
-  download.rs   atomic Hugging Face streaming downloader with progress
-assets/         multi-size Windows .ico and 512x512 PNG icon
-packaging/      Windows Inno Setup script and Linux .desktop file
-.github/        CI and cross-platform Windows, macOS & Linux release workflows
+  main.rs            single-instance lifecycle, dark theme, pill/settings/studio orchestration, CLI
+  overlay.rs         Dynamic Island floating capsule and Models & Settings popover (GPUI Kit)
+  profile_setup.rs   dark-glass Personal Rewrite Studio (model picker, history import, review & compare)
+  rewrite.rs         optional local Ollama text-only rewriter (Qwen 3 / Qwen 2.5 / Sarvam AI)
+  personalization.rs pasted transcript parser, review draft state, profile validation & budgets
+  history_import.rs  read-only local assistant history discovery & user-turn extractors (+ extra.rs)
+  engine.rs          dedicated GPU streaming ASR worker (parakeet-rs on Burn Vulkan / Metal)
+  audio.rs           WASAPI / CoreAudio / ALSA mic capture + 16 kHz linear resampler + waveform
+  hotkey.rs          global F1 listener, auto-paste (SendInput / osascript / xdotool), Windows DWM strip
+  tray.rs            system tray / menu bar icon (amber/indigo/crimson) and menu
+  config.rs          ASR & rewrite model manifests, portable data paths, sign-in autostart
+  download.rs        atomic Hugging Face streaming downloader with progress
+assets/              multi-size Windows .ico and 512x512 PNG icon
+packaging/           Windows Inno Setup script and Linux .desktop file
+.github/             CI and cross-platform Windows, macOS & Linux release workflows
 ```
 
 ## License
