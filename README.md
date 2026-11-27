@@ -138,22 +138,25 @@ Rephrasing is **100% optional and OFF by default** — switch it ON or OFF anyti
 Settings**, the system tray, or the **Personal Rewrite Studio** header. When OFF, Voicebar pastes
 raw GPU speech-to-text directly with zero LLM latency.
 
-When ON, Voicebar uses a **pure text-only local Ollama model** (no vision towers or tool bloat):
+When ON, Voicebar uses its **built-in `llama.cpp` engine (Vulkan / Metal / CPU)** — **zero Ollama required** — running pure text-only GGUF models downloaded directly from Hugging Face:
 
 | Rewrite Model | Size | Highlights |
 | --- | --- | --- |
-| **Qwen 3 · 4B** *(default)* | ~2.5 GB | Pure text-only, fast English, Hindi & Hinglish cleanup (fits 8 GB GPU) |
-| **Qwen 3 · 1.7B** | ~1.4 GB | Pure text-only, ultra-fast low-VRAM cleanup across 119 languages |
-| **Qwen 2.5 · 3B** | ~1.9 GB | Pure text-only, instant Hinglish & Indian English cleanup, zero thinking overhead |
-| **Sarvam Translate · 4B** | ~2.5 GB | Sarvam AI text-only GGUF across 22 Indian languages (fits 8 GB GPU) |
-| **Sarvam M · 24B** | ~14.5 GB | Sarvam AI Apache-2.0 text-only Indian languages & English (16 GB+ RAM / Apple Silicon) |
+| **Sarvam Translate · 4B** *(default)* | ~2.4 GB | Sarvam AI Gemma-3 4B GGUF · 22 Indian languages + English & code-mixing (8 GB GPU) |
+| **Qwen 3 · 0.6B** | ~378 MB | Ultra-tiny text-only GGUF · instant on any CPU or low-VRAM GPU |
+| **Qwen 2.5 · 1.5B** | ~1.07 GB | Small & snappy · English & Hinglish cleanup · zero thinking delay |
+| **Qwen 3 · 1.7B** | ~1.06 GB | Fast low-VRAM text cleanup across 119 languages |
+| **Qwen 2.5 · 3B** | ~2.0 GB | Instant Hinglish & Indian English cleanup · zero thinking overhead |
+| **Qwen 3 · 4B** | ~2.4 GB | Balanced English, Hindi & Hinglish cleanup (8 GB GPU) |
+| **Sarvam M · 24B** | ~13.7 GB | Sarvam AI Apache-2.0 Mistral 24B · Indic & English (16 GB+ RAM / Apple Silicon) |
 
 Open **Personal Rewrite Profile…** from the tray or **Set up…** from Models & Settings:
 
-1. Choose your preferred local text-only Ollama model (downloads stream with live progress and can be
-   cancelled anytime), then paste transcripts separated by a blank line or select local coding
-   assistants to scan read-only (**Select all** checks detected sources; **Import selected** confirms
-   the read and shows coverage).
+1. Choose your preferred local text-only GGUF model and click **Download** — Voicebar automatically
+   fetches its pre-built `llama.cpp` Vulkan/Metal runtime (~16–38 MB) and the `.gguf` weights with
+   live progress and cancellation. Then paste transcripts separated by a blank line or select local
+   coding assistants to scan read-only (**Select all** checks detected sources; **Import selected**
+   confirms the read and shows coverage).
 2. For up to five examples, choose **Light cleanup**, **Natural rephrase**, **Keep original**, or
    **Write my own** (or skip). Approved examples preserve uncertainty (`maybe`, `might`, `could`),
    negation, deadlines, and natural Hinglish/Indian English phrasing.
@@ -180,29 +183,34 @@ To test the rewriter from the CLI without a microphone:
 "Please keep the ticket open." | voicebar --rewrite-stdin --rewrite-language hi --rewrite-model sarvam-translate
 ```
 
-### Legacy local profiles
+### Built-in `llama.cpp` runtime (Zero Ollama)
 
-An existing enabled profile built with the `voicebar-personal` model continues to use it until
-you activate a new profile. The legacy script helpers (`tools/voicebar_history.py`,
-`tools/voicebar_personal.py`) remain available if you prefer building an Ollama `Modelfile` manually.
+Voicebar `v0.3.0+` manages its own pre-built `llama-server` binary (Vulkan on Windows/Linux, Metal on
+Apple Silicon, with automatic CPU fallback) and `.gguf` weights inside its local data directory:
+- Runtime: `<voicebar-data>/runtime/llama-cpp/`
+- Models: `<voicebar-data>/models/llm/`
+
+No separate Ollama daemon or background service is installed. Switching **Optional Rephrasing** OFF
+or quitting Voicebar immediately stops `llama-server` and frees GPU VRAM.
 
 ## CLI helpers
 
 ```powershell
-voicebar --version                     # print version
-voicebar --download                    # pre-download the active model
-voicebar --download --model eou        # pre-download Parakeet EOU 120M
-voicebar --test-wav sample.wav         # benchmark live GPU streaming on a WAV file
-voicebar --cpu                         # force CPU Burn backend
+voicebar --version                                     # print version
+voicebar --download                                    # pre-download the active ASR model
+voicebar --download --model eou                        # pre-download Parakeet EOU 120M
+voicebar --download-llm --rewrite-model sarvam-translate # pre-download llama.cpp + Sarvam Translate 4B
+voicebar --test-wav sample.wav                         # benchmark live GPU streaming on a WAV file
+voicebar --cpu                                         # force CPU backend
 ```
 
 ## Privacy & Security
 
 - **100% offline inference.** Audio is captured directly from your OS microphone (`cpal`) and
   processed strictly on your local GPU/CPU. Zero audio bytes ever leave your machine.
-- **Local processing.** ASR weights are fetched over HTTPS from Hugging Face
-  (`altunenes/parakeet-rs`) with atomic `.part` writes. Optional Personal Rewrite sends the
-  final transcript to Ollama at `127.0.0.1:11434` using a local model installed separately.
+- **Local processing.** ASR weights (`altunenes/parakeet-rs`) and optional GGUF rewrite weights are
+  fetched over HTTPS from Hugging Face with atomic `.part` writes. Optional Personal Rewrite runs
+  Voicebar's managed `llama-server` strictly on `127.0.0.1` (auto-stopped when switched OFF or on quit).
 - **Single-instance local lock.** Binds only to `127.0.0.1:7981` to toggle an existing instance.
 
 ## Build from source
@@ -225,7 +233,8 @@ src/
   main.rs            single-instance lifecycle, dark theme, pill/settings/studio orchestration, CLI
   overlay.rs         Dynamic Island floating capsule and Models & Settings popover (GPUI Kit)
   profile_setup.rs   dark-glass Personal Rewrite Studio (model picker, history import, review & compare)
-  rewrite.rs         optional local Ollama text-only rewriter (Qwen 3 / Qwen 2.5 / Sarvam AI)
+  llama_engine.rs    self-contained built-in llama.cpp (Vulkan/Metal/CPU) manager & GGUF downloader
+  rewrite.rs         optional local text-only rewriter & Indic translator (Sarvam AI / Qwen 3 / Qwen 2.5)
   personalization.rs pasted transcript parser, review draft state, profile validation & budgets
   history_import.rs  read-only local assistant history discovery & user-turn extractors (+ extra.rs)
   engine.rs          dedicated GPU streaming ASR worker (parakeet-rs on Burn Vulkan / Metal)

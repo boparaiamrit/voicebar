@@ -1,16 +1,17 @@
-//! Dark-glass Personal Rewrite Studio for optional local dictation rephrasing.
+//! Dark-glass Personal Rewrite Studio for optional local dictation rephrasing & translation.
 //! Clean 3-zone app shell (Fixed Header + Overflow-Safe Scroll Body + Sticky Footer):
-//! - Detects Ollama state (Running / Installed-but-stopped / Not Installed) with one-click Start & Install.
-//! - Offers ultra-tiny (<1 GB) through balanced & Sarvam AI Indian-language text-only local models.
+//! - Uses Voicebar's built-in `llama.cpp` (Vulkan / Metal / CPU) engine — zero Ollama required.
+//! - Ships Sarvam Translate 4B (default, 22 Indian languages + English & code-mixing) alongside
+//!   ultra-tiny 378 MB Qwen 3 0.6B through Sarvam M 24B directly from Hugging Face GGUFs.
 //! - Clean 2-column history picker, zero text overflow, responsive first-click controls, and sticky footer CTAs.
 
-use crate::config::RewriteModel;
+use crate::config::{RewriteModel, is_rewrite_model_downloaded};
 use crate::history_import::{self, Source};
+use crate::llama_engine::{self, RuntimeReadiness};
 use crate::overlay::icon;
 use crate::personalization::{
     PREVIEW_COUNT, ProfilePreview, RewritePair, SetupDraft, count_paste_entries,
 };
-use crate::rewrite::OllamaInstallState;
 use crate::{VoiceState, hotkey, rewrite};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder;
@@ -97,32 +98,31 @@ impl Page {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ModelStatus {
-    Checking,
     Ready,
-    Missing,
-    OllamaStopped,
-    OllamaNotInstalled,
-    Error(&'static str),
+    ModelMissing,
+    EngineMissing,
 }
 
 enum Failure {
     MissingModel,
-    OllamaStopped,
-    OllamaNotInstalled,
     Message(&'static str),
 }
 
 fn check_model(model: RewriteModel) -> Result<(), Failure> {
-    match rewrite::check_ollama_state() {
-        OllamaInstallState::NotInstalled => return Err(Failure::OllamaNotInstalled),
-        OllamaInstallState::InstalledStopped => return Err(Failure::OllamaStopped),
-        OllamaInstallState::Running => {}
+    if rewrite::check_readiness(model) == RuntimeReadiness::Ready {
+        Ok(())
+    } else {
+        Err(Failure::MissingModel)
     }
-    match rewrite::probe_model(model).map_err(Failure::Message)? {
-        true => Ok(()),
-        false => Err(Failure::MissingModel),
+}
+
+fn readiness_to_status(r: RuntimeReadiness) -> ModelStatus {
+    match r {
+        RuntimeReadiness::Ready => ModelStatus::Ready,
+        RuntimeReadiness::ModelMissing => ModelStatus::ModelMissing,
+        RuntimeReadiness::EngineMissing => ModelStatus::EngineMissing,
     }
 }
 
@@ -156,7 +156,8 @@ impl Drop for Setup {
 
 impl Setup {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut this = Self {
+        let active = cx.global::<VoiceState>().config.rewrite_model;
+        Self {
             page: Page::Start,
             paste: cx.new(|cx| TextareaState::new(window, cx)),
             own: cx.new(|cx| TextareaState::new(window, cx)),
@@ -169,16 +170,14 @@ impl Setup {
             editing: false,
             preview: None,
             comparison_index: 0,
-            model_status: ModelStatus::Checking,
+            model_status: readiness_to_status(rewrite::check_readiness(active)),
             confirm_clear: false,
             saved_example_count: 0,
             busy: None,
             pull_progress: Arc::new(Mutex::new(None)),
             cancel: None,
             problem: None,
-        };
-        this.probe_active_model(cx);
-        this
+        }
     }
 
     fn active_model(&self, cx: &App) -> RewriteModel {
@@ -187,53 +186,8 @@ impl Setup {
 
     fn probe_active_model(&mut self, cx: &mut Context<Self>) {
         let model = self.active_model(cx);
-        self.model_status = ModelStatus::Checking;
-        let task = cx.background_executor().spawn(async move {
-            match rewrite::check_ollama_state() {
-                OllamaInstallState::NotInstalled => ModelStatus::OllamaNotInstalled,
-                OllamaInstallState::InstalledStopped => ModelStatus::OllamaStopped,
-                OllamaInstallState::Running => match rewrite::probe_model(model) {
-                    Ok(true) => ModelStatus::Ready,
-                    Ok(false) => ModelStatus::Missing,
-                    Err(msg) => ModelStatus::Error(msg),
-                },
-            }
-        });
-        cx.spawn(async move |view, cx| {
-            let status = task.await;
-            let _ = view.update(cx, |view, cx| {
-                if view.active_model(cx) != model {
-                    return;
-                }
-                view.model_status = status;
-                cx.notify();
-            });
-        })
-        .detach();
-    }
-
-    fn start_ollama(&mut self, cx: &mut Context<Self>) {
-        self.run(
-            "Starting local Ollama service…",
-            cx,
-            |_| rewrite::start_ollama_daemon().map_err(Failure::Message),
-            |view, _, cx| {
-                view.problem = None;
-                view.probe_active_model(cx);
-            },
-        );
-    }
-
-    fn install_ollama(&mut self, cx: &mut Context<Self>) {
-        self.run(
-            "Installing Ollama locally (this can take 1–2 minutes)…",
-            cx,
-            |cancel| rewrite::install_ollama_auto(cancel).map_err(Failure::Message),
-            |view, _, cx| {
-                view.problem = None;
-                view.probe_active_model(cx);
-            },
-        );
+        self.model_status = readiness_to_status(rewrite::check_readiness(model));
+        cx.notify();
     }
 
     fn select_model(&mut self, model: RewriteModel, cx: &mut Context<Self>) {
@@ -299,15 +253,10 @@ impl Setup {
                 match result {
                     Ok(value) => apply(view, value, cx),
                     Err(error) => {
-                        match error {
-                            Failure::MissingModel => view.model_status = ModelStatus::Missing,
-                            Failure::OllamaStopped => {
-                                view.model_status = ModelStatus::OllamaStopped
-                            }
-                            Failure::OllamaNotInstalled => {
-                                view.model_status = ModelStatus::OllamaNotInstalled
-                            }
-                            Failure::Message(_) => {}
+                        if matches!(error, Failure::MissingModel) {
+                            let active = view.active_model(cx);
+                            view.model_status =
+                                readiness_to_status(rewrite::check_readiness(active));
                         }
                         view.problem = Some(error);
                     }
@@ -392,17 +341,18 @@ impl Setup {
             return;
         };
         let model = self.active_model(cx);
+        let use_gpu = cx.global::<VoiceState>().config.use_gpu;
         self.run(
             format!("Generating two local rewrites with {}…", model.short_label()),
             cx,
             move |cancel| {
                 check_model(model)?;
-                let light = rewrite::rewrite_sample(model, &sample, "", None, true)
+                let light = rewrite::rewrite_sample(model, use_gpu, &sample, "", None, true)
                     .map_err(Failure::Message)?;
                 if cancel.load(Ordering::Acquire) {
                     return Err(Failure::Message("Cancelled."));
                 }
-                let natural = rewrite::rewrite_sample(model, &sample, "", None, false)
+                let natural = rewrite::rewrite_sample(model, use_gpu, &sample, "", None, false)
                     .map_err(Failure::Message)?;
                 Ok((light, natural))
             },
@@ -452,6 +402,7 @@ impl Setup {
             }
         };
         let model = self.active_model(cx);
+        let use_gpu = cx.global::<VoiceState>().config.use_gpu;
         let language = cx.global::<VoiceState>().config.rewrite_language.clone();
         self.run(
             format!("Comparing 3 dictations locally with {}…", model.short_label()),
@@ -464,13 +415,14 @@ impl Setup {
                         return Err(Failure::Message("Cancelled."));
                     }
                     let standard =
-                        rewrite::rewrite_sample(model, original, &language, None, false)
+                        rewrite::rewrite_sample(model, use_gpu, original, &language, None, false)
                             .map_err(Failure::Message)?;
                     if cancel.load(Ordering::Acquire) {
                         return Err(Failure::Message("Cancelled."));
                     }
                     let personalized = rewrite::rewrite_sample(
                         model,
+                        use_gpu,
                         original,
                         &language,
                         Some(&inputs.profile),
@@ -519,8 +471,14 @@ impl Setup {
         })
         .detach();
 
+        let status_label = if self.model_status == ModelStatus::EngineMissing {
+            format!("Downloading built-in llama.cpp + {}…", model.display_name())
+        } else {
+            format!("Downloading {} from Hugging Face…", model.display_name())
+        };
+
         self.run(
-            format!("Downloading {} through local Ollama…", model.display_name()),
+            status_label,
             cx,
             move |cancel| {
                 let res = rewrite::download_model_with_progress(model, cancel, |p| {
@@ -533,7 +491,7 @@ impl Setup {
                 res
             },
             |view, _, cx| {
-                view.model_status = ModelStatus::Ready;
+                view.probe_active_model(cx);
                 match view.page {
                     Page::Review => view.generate_suggestions(cx),
                     Page::Fresh => view.compare(cx),
@@ -876,84 +834,16 @@ impl Setup {
         }
     }
 
-    /// Actionable Ollama setup banner whenever Ollama is missing or stopped.
-    fn ollama_action_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
-        let busy = self.busy.is_some();
+    /// Actionable one-click setup banner whenever the built-in llama.cpp runtime or selected GGUF is not downloaded yet.
+    fn engine_action_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        if self.busy.is_some() {
+            return None;
+        }
+        let model = self.active_model(cx);
         let amber = c(0xfbbf24);
         let indigo = c(0x818cf8);
         match self.model_status {
-            ModelStatus::OllamaStopped => Some(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .p(px(12.))
-                    .rounded(px(12.))
-                    .bg(ca(0xfbbf2414))
-                    .border_1()
-                    .border_color(ca(0xfbbf2444))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .gap(px(12.))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.))
-                            .child(icon("power", 16., amber))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(2.))
-                                    .child(
-                                        div()
-                                            .text_size(px(13.))
-                                            .font_weight(FontWeight::SEMIBOLD)
-                                            .text_color(c(0xf4f4f6))
-                                            .child("Ollama is installed, but not running"),
-                                    )
-                                    .child(
-                                        div()
-                                            .w_full()
-                                            .min_w_0()
-                                            .text_size(px(12.))
-                                            .line_height(px(17.))
-                                            .text_color(c(0xd1d5db))
-                                            .child("Start Ollama locally to download models or run optional rephrasing. Direct GPU dictation still works without it."),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        row()
-                            .flex_none()
-                            .child(btn(
-                                cx,
-                                "banner-start-ollama",
-                                "Start Ollama",
-                                BtnTone::Primary,
-                                busy,
-                                false,
-                                |s, _, cx| s.start_ollama(cx),
-                            ))
-                            .child(btn(
-                                cx,
-                                "banner-recheck-stopped",
-                                "Recheck",
-                                BtnTone::Secondary,
-                                busy,
-                                false,
-                                |s, _, cx| s.probe_active_model(cx),
-                            )),
-                    ),
-            ),
-            ModelStatus::OllamaNotInstalled => Some(
+            ModelStatus::EngineMissing => Some(
                 div()
                     .w_full()
                     .min_w_0()
@@ -988,7 +878,7 @@ impl Setup {
                                             .text_size(px(13.))
                                             .font_weight(FontWeight::SEMIBOLD)
                                             .text_color(c(0xf4f4f6))
-                                            .child("Ollama not detected on this computer"),
+                                            .child("Built-in llama.cpp engine (Zero Ollama required)"),
                                     )
                                     .child(
                                         div()
@@ -997,43 +887,81 @@ impl Setup {
                                             .text_size(px(12.))
                                             .line_height(px(17.))
                                             .text_color(c(0xd1d5db))
-                                            .child("Install free local Ollama to run tiny 520 MB–4B rephrasing models privately offline. Direct GPU dictation needs nothing extra."),
+                                            .child(format!(
+                                                "One-click download fetches Voicebar's Vulkan/Metal llama.cpp runtime (~37 MB) + {} ({}) from GitHub & Hugging Face. Direct GPU dictation works without it.",
+                                                model.display_name(),
+                                                model.size_label()
+                                            )),
                                     ),
                             ),
                     )
-                    .child(
-                        row()
-                            .flex_none()
-                            .child(btn(
-                                cx,
-                                "banner-install-ollama",
-                                "Install Ollama",
-                                BtnTone::Primary,
-                                busy,
-                                false,
-                                |s, _, cx| s.install_ollama(cx),
-                            ))
-                            .child(btn(
-                                cx,
-                                "banner-download-ollama",
-                                "Website",
-                                BtnTone::Secondary,
-                                false,
-                                false,
-                                |_, _, _| rewrite::open_ollama_download_page(),
-                            ))
-                            .child(btn(
-                                cx,
-                                "banner-recheck-missing",
-                                "Recheck",
-                                BtnTone::Ghost,
-                                busy,
-                                false,
-                                |s, _, cx| s.probe_active_model(cx),
-                            )),
-                    ),
+                    .child(action_primary(
+                        cx,
+                        "banner-download-engine-model",
+                        "Download Engine + Model",
+                        |s, _, cx| s.download(cx),
+                    )),
             ),
-            _ => None,
+            ModelStatus::ModelMissing => Some(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(ca(0xfbbf2414))
+                    .border_1()
+                    .border_color(ca(0xfbbf2444))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(icon("download", 16., amber))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c(0xf4f4f6))
+                                            .child(format!("{} is not downloaded yet", model.display_name())),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .line_height(px(17.))
+                                            .text_color(c(0xd1d5db))
+                                            .child(format!(
+                                                "Built-in llama.cpp is installed. Download {} ({}) directly from Hugging Face to run 100% locally.",
+                                                model.display_name(),
+                                                model.size_label()
+                                            )),
+                                    ),
+                            ),
+                    )
+                    .child(action_primary(
+                        cx,
+                        "banner-download-model",
+                        format!("Download {}", model.size_label()),
+                        |s, _, cx| s.download(cx),
+                    )),
+            ),
+            ModelStatus::Ready => None,
         }
     }
 
@@ -1053,7 +981,7 @@ impl Setup {
         let text_dim = c(0x71717a);
 
         let mut body = col().gap(px(14.)).child(subtle(
-            "Optional local rephrasing cleans spoken fillers, self-corrections, and phrasing using a fast text-only Ollama model. Switch Rephrasing OFF anytime to paste raw GPU speech-to-text directly.",
+            "Optional local rephrasing and Indic translation powered by Voicebar's built-in llama.cpp engine (zero Ollama required). Switch Rephrasing OFF anytime to paste raw GPU speech-to-text directly.",
         ));
 
         // 1. Existing active profile card
@@ -1320,26 +1248,24 @@ impl Setup {
                 ),
         );
 
-        // 3. Local Text-Only Ollama Model Selector (from ultra-tiny 520 MB up to Sarvam AI)
+        // 3. Local Text-Only GGUF Model Selector (built-in llama.cpp — from 378 MB up to Sarvam AI)
         let mut model_cards = div().w_full().min_w_0().flex().flex_col().gap(px(6.));
         for (i, model) in RewriteModel::ALL.into_iter().enumerate() {
             let selected = model == active_model;
-            let show_install = selected && matches!(self.model_status, ModelStatus::Missing) && !busy;
+            let weights_present = is_rewrite_model_downloaded(model);
+            let show_install = selected && self.model_status != ModelStatus::Ready && !busy;
             let status_chip = if selected {
                 match self.model_status {
-                    ModelStatus::Ready => Some(badge_pill("Installed", ca(0x4ade8022), emerald)),
-                    ModelStatus::Missing => Some(badge_pill("Not downloaded", ca(0xfbbf2422), amber)),
-                    ModelStatus::Checking => Some(badge_pill("Checking…", ca(0xffffff10), text_mid)),
-                    ModelStatus::OllamaStopped => {
-                        Some(badge_pill("Ollama stopped", ca(0xfbbf2422), amber))
+                    ModelStatus::Ready => Some(badge_pill("Ready", ca(0x4ade8022), emerald)),
+                    ModelStatus::ModelMissing => {
+                        Some(badge_pill("Not downloaded", ca(0xfbbf2422), amber))
                     }
-                    ModelStatus::OllamaNotInstalled => {
-                        Some(badge_pill("Install Ollama", ca(0xf8717122), c(0xf87171)))
-                    }
-                    ModelStatus::Error(_) => {
-                        Some(badge_pill("Unavailable", ca(0xf8717122), c(0xf87171)))
+                    ModelStatus::EngineMissing => {
+                        Some(badge_pill("Engine + Model", ca(0x6366f128), indigo))
                     }
                 }
+            } else if weights_present {
+                Some(badge_pill("Downloaded", ca(0x4ade801c), emerald))
             } else {
                 None
             };
@@ -1395,15 +1321,26 @@ impl Setup {
                                             .text_color(text_hi)
                                             .child(model.display_name()),
                                     )
+                                    .when(model == RewriteModel::SarvamTranslate4b, |d| {
+                                        d.child(badge_pill("Default · India", ca(0xa78bfa2c), violet))
+                                    })
                                     .when(model.is_small_fast(), |d| {
                                         d.child(badge_pill("Tiny · Fast", ca(0x38bdf822), cyan))
                                     })
                                     .when(model == RewriteModel::Qwen3_4b, |d| {
                                         d.child(badge_pill("Balanced", ca(0x6366f128), indigo))
                                     })
-                                    .when(model.is_indic_focused(), |d| {
-                                        d.child(badge_pill("India / Indic", ca(0xa78bfa24), violet))
-                                    }),
+                                    .when(
+                                        model.is_indic_focused()
+                                            && model != RewriteModel::SarvamTranslate4b,
+                                        |d| {
+                                            d.child(badge_pill(
+                                                "India / Indic",
+                                                ca(0xa78bfa24),
+                                                violet,
+                                            ))
+                                        },
+                                    ),
                             )
                             .child(
                                 div()
@@ -1455,13 +1392,13 @@ impl Setup {
                                 .text_size(px(11.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(text_dim)
-                                .child("LOCAL REWRITE MODELS · PURE TEXT-ONLY (520 MB TO 24B)"),
+                                .child("LOCAL GGUF MODELS · BUILT-IN LLAMA.CPP (378 MB TO 13.7 GB)"),
                         )
                         .child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(text_dim)
-                                .child("Runs 100% locally via Ollama"),
+                                .child("Zero Ollama · Vulkan / Metal / CPU"),
                         ),
                 )
                 .child(model_cards),
@@ -1894,7 +1831,10 @@ impl Setup {
                     .flex()
                     .flex_row()
                     .gap(px(12.))
-                    .child(loading_skeleton("LIGHT CLEANUP", "Generating with Ollama…"))
+                    .child(loading_skeleton(
+                        "LIGHT CLEANUP",
+                        "Generating locally via llama.cpp…",
+                    ))
                     .child(loading_skeleton(
                         "NATURAL REPHRASE",
                         "Preserving certainty & tone…",
@@ -2476,12 +2416,12 @@ impl Render for Setup {
                 .child(self.title()),
         );
 
-        // Actionable Ollama banner whenever Ollama is missing or stopped
-        if let Some(ollama_banner) = self.ollama_action_banner(cx) {
-            contents = contents.child(ollama_banner);
+        // Actionable one-click setup banner whenever built-in llama.cpp runtime or GGUF weights are missing
+        if let Some(engine_banner) = self.engine_action_banner(cx) {
+            contents = contents.child(engine_banner);
         }
 
-        // Live busy banner (with streaming Ollama pull progress bar + Cancel)
+        // Live busy banner (with streaming download progress bar + Cancel)
         if let Some(status) = &self.busy {
             let pull = self.pull_progress.lock().ok().and_then(|g| g.clone());
             let mut banner = div()
@@ -2570,37 +2510,12 @@ impl Render for Setup {
                         ca(0xfbbf2414),
                         ca(0xfbbf2448),
                         format!(
-                            "{} is not downloaded in local Ollama yet. Download it locally to generate suggestions and comparisons.",
+                            "{} needs Voicebar's built-in llama.cpp runtime and GGUF weights. Download them locally to generate suggestions and comparisons.",
                             model.display_name()
                         ),
-                        Some(action_primary(cx, "get-model", "Download model", |s, _, cx| {
+                        Some(action_primary(cx, "get-model", "Download now", |s, _, cx| {
                             s.download(cx)
                         })),
-                    ),
-                    Failure::OllamaStopped => (
-                        c(0xfbbf24),
-                        ca(0xfbbf2414),
-                        ca(0xfbbf2448),
-                        "Ollama is installed but stopped. Start it locally to continue.".into(),
-                        Some(action_primary(
-                            cx,
-                            "err-start-ollama",
-                            "Start Ollama",
-                            |s, _, cx| s.start_ollama(cx),
-                        )),
-                    ),
-                    Failure::OllamaNotInstalled => (
-                        c(0x818cf8),
-                        ca(0x6366f114),
-                        ca(0x818cf848),
-                        "Ollama is not installed yet. Install local Ollama to generate rewrites."
-                            .into(),
-                        Some(action_primary(
-                            cx,
-                            "err-install-ollama",
-                            "Install Ollama",
-                            |s, _, cx| s.install_ollama(cx),
-                        )),
                     ),
                     Failure::Message(error) => (
                         c(0xf87171),
@@ -2649,15 +2564,21 @@ impl Render for Setup {
 
         // Studio top header bar
         let (dot_color, status_text) = match self.model_status {
-            ModelStatus::Ready => (c(0x4ade80), format!("{} · Ready", model.short_label())),
-            ModelStatus::Missing => (
+            ModelStatus::Ready => {
+                if llama_engine::is_server_running_for(model) {
+                    (c(0x4ade80), format!("{} · Running", model.short_label()))
+                } else {
+                    (c(0x4ade80), format!("{} · Ready", model.short_label()))
+                }
+            }
+            ModelStatus::ModelMissing => (
                 c(0xfbbf24),
                 format!("{} · Not downloaded", model.short_label()),
             ),
-            ModelStatus::Checking => (c(0x818cf8), "Checking Ollama…".to_string()),
-            ModelStatus::OllamaStopped => (c(0xfbbf24), "Ollama stopped · Click to recheck".into()),
-            ModelStatus::OllamaNotInstalled => (c(0xf87171), "Ollama not installed".into()),
-            ModelStatus::Error(_) => (c(0xf87171), "Ollama offline".into()),
+            ModelStatus::EngineMissing => (
+                c(0x818cf8),
+                "Built-in llama.cpp · Download ready".into(),
+            ),
         };
 
         let mut header = div()
@@ -2698,7 +2619,7 @@ impl Render for Setup {
                     )
                     .child(
                         div()
-                            .id("header-ollama-status")
+                            .id("header-engine-status")
                             .px(px(9.))
                             .py(px(3.5))
                             .rounded(px(999.))

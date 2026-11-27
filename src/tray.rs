@@ -177,7 +177,7 @@ impl Tray {
             "GPU Acceleration (Vulkan)"
         };
         let personal_rewrite = CheckMenuItem::new(
-            "Optional Rephrasing (Local Ollama)",
+            "Optional Rephrasing (Built-in llama.cpp)",
             true,
             cfg.personal_rewrite,
             None,

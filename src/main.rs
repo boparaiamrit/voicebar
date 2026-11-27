@@ -14,6 +14,7 @@ mod download;
 mod engine;
 mod history_import;
 mod hotkey;
+mod llama_engine;
 mod overlay;
 mod personalization;
 mod profile_setup;
@@ -470,12 +471,19 @@ pub fn toggle_auto_paste_from_ui(cx: &mut App) {
 }
 
 pub fn toggle_personal_rewrite_from_ui(cx: &mut App) {
-    let st = cx.global_mut::<VoiceState>();
-    st.config.personal_rewrite = !st.config.personal_rewrite;
-    st.config.save();
-    if st.pending_rewrite.take().is_some() {
-        let original = st.last_transcript.clone();
-        deliver_transcript(cx, original, false, true);
+    let turning_off = {
+        let st = cx.global_mut::<VoiceState>();
+        st.config.personal_rewrite = !st.config.personal_rewrite;
+        st.config.save();
+        if st.pending_rewrite.take().is_some() {
+            let original = st.last_transcript.clone();
+            deliver_transcript(cx, original, false, true);
+        }
+        !cx.global::<VoiceState>().config.personal_rewrite
+    };
+    if turning_off {
+        // Immediately unload background llama-server to free VRAM/RAM.
+        std::thread::spawn(rewrite::shutdown);
     }
     sync_tray(cx);
     cx.refresh_windows();
@@ -704,6 +712,7 @@ fn finish_dictation(cx: &mut App, text: String) {
             if let Some(result) = rewrite::start(
                 &text,
                 &config.rewrite_language,
+                config.use_gpu,
                 rewrite::RewriteMode::configured(&config),
             ) {
                 st.pending_rewrite = Some(PendingRewrite {
@@ -883,6 +892,7 @@ fn handle_tray_action(cx: &mut App, action: tray::TrayAction) {
         SelectLanguage(lang) => select_language_from_settings(cx, &lang),
         OpenModelsFolder => open_folder(&models_root()),
         Quit => {
+            rewrite::shutdown();
             let _ = cx
                 .global::<EngineGlobal>()
                 .0
@@ -960,6 +970,7 @@ fn start_loop(cx: &mut App) {
 struct CliArgs {
     print_version: bool,
     download_only: bool,
+    download_llm: bool,
     test_wav: Option<PathBuf>,
     model_override: Option<ModelKind>,
     lang_override: Option<String>,
@@ -975,6 +986,7 @@ fn parse_args() -> CliArgs {
     let mut out = CliArgs {
         print_version: false,
         download_only: false,
+        download_llm: false,
         test_wav: None,
         model_override: None,
         lang_override: None,
@@ -991,6 +1003,7 @@ fn parse_args() -> CliArgs {
         match args[i].as_str() {
             "--version" | "-V" | "version" => out.print_version = true,
             "--download" => out.download_only = true,
+            "--download-llm" => out.download_llm = true,
             "--cpu" => out.force_cpu = true,
             "--personal-rewrite" => out.personal_rewrite = true,
             "--rewrite-stdin" => out.rewrite_stdin = true,
@@ -1106,6 +1119,15 @@ fn main() {
     }
 
     let mut cfg = AppConfig::load();
+    if let Some(m) = cli.model_override {
+        cfg.model = m;
+    }
+    if let Some(l) = cli.lang_override {
+        cfg.language = l;
+    }
+    if cli.force_cpu {
+        cfg.use_gpu = false;
+    }
     if let Some(model) = cli.rewrite_model {
         cfg.rewrite_model = model;
     }
@@ -1115,24 +1137,44 @@ fn main() {
     if cli.personal_rewrite {
         cfg.personal_rewrite = true;
     }
+    if cli.download_llm {
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        eprintln!(
+            "Downloading built-in llama.cpp + {} to {}…",
+            cfg.rewrite_model.display_name(),
+            config::llm_models_dir().display()
+        );
+        match rewrite::download_model_with_progress(cfg.rewrite_model, &cancel, |p| {
+            eprint!(
+                "\r  {}  {:.1}/{:.1} MB ({:.0}%)   ",
+                p.status,
+                p.completed as f64 / 1_048_576.0,
+                p.total as f64 / 1_048_576.0,
+                p.fraction() * 100.0
+            );
+        }) {
+            Ok(()) => {
+                eprintln!("\nDone: {}", config::llm_model_path(cfg.rewrite_model).display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("\nDownload error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if cli.rewrite_stdin {
-        if let Err(message) = rewrite::run_stdin(
+        let res = rewrite::run_stdin(
             &cfg.rewrite_language,
+            cfg.use_gpu,
             rewrite::RewriteMode::configured(&cfg),
-        ) {
+        );
+        rewrite::shutdown();
+        if let Err(message) = res {
             eprintln!("{message}");
             std::process::exit(1);
         }
         return;
-    }
-    if let Some(m) = cli.model_override {
-        cfg.model = m;
-    }
-    if let Some(l) = cli.lang_override {
-        cfg.language = l;
-    }
-    if cli.force_cpu {
-        cfg.use_gpu = false;
     }
 
     if cli.download_only {

@@ -1004,18 +1004,20 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
     // Dedicated Optional Rephrasing Card — crystal-clear ON/OFF switch, zero layout cramping!
     let rewrite_on = cfg.personal_rewrite;
     let rewrite_model = cfg.rewrite_model;
+    let rewrite_ready =
+        crate::rewrite::check_readiness(rewrite_model) == crate::llama_engine::RuntimeReadiness::Ready;
     let rewrite_status = if !rewrite_on {
         ("OFF".to_string(), ca(0xffffff0e), text_dim)
+    } else if !rewrite_ready {
+        ("Needs download".to_string(), ca(0xfbbf2422), c(0xfbbf24))
     } else if has_profile {
         (
             format!("Profile · {example_count}"),
             emerald_bg,
             emerald,
         )
-    } else if cfg.legacy_rewrite {
-        ("Legacy".to_string(), indigo_bg, indigo)
     } else {
-        ("Standard".to_string(), indigo_bg, indigo)
+        ("llama.cpp".to_string(), indigo_bg, indigo)
     };
 
     let rewrite_card = div()
