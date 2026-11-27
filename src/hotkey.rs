@@ -197,14 +197,17 @@ pub fn paste_ctrl_v_async(_fallback_hwnd: isize) {
     });
 }
 
-/// Strip Windows 11's native DWM outer border ring and OS corner frame from our visible popup HWND.
+/// Strip Windows 11's native DWM outer border ring and OS corner frame from our frameless
+/// floating popup HWNDs (`WS_EX_TOOLWINDOW` only — never touches regular titled windows like
+/// the Personal Rewrite Studio).
 #[cfg(windows)]
 pub fn strip_dwm_outer_ring() {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GWL_STYLE, GetWindowThreadProcessId, IsWindowVisible, SWP_FRAMECHANGED,
-        SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos,
+        EnumWindows, GWL_EXSTYLE, GWL_STYLE, GetWindowLongPtrW, GetWindowThreadProcessId,
+        IsWindowVisible, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+        SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, WS_EX_TOOLWINDOW,
     };
 
     #[link(name = "dwmapi")]
@@ -232,6 +235,11 @@ pub fn strip_dwm_outer_ring() {
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(hwnd, &mut pid);
             if pid == target_pid as u32 {
+                // Only modify frameless floating popups (WindowKind::PopUp sets WS_EX_TOOLWINDOW).
+                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                if (ex_style & WS_EX_TOOLWINDOW) == 0 {
+                    return 1;
+                }
                 // Switch from WS_OVERLAPPED (0) to pure frameless WS_POPUP | WS_VISIBLE.
                 SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP_VISIBLE);
                 // Explicitly tell Windows 11 DWM: no 1px outer border and no OS corner ring.
@@ -249,7 +257,7 @@ pub fn strip_dwm_outer_ring() {
                     &no_round as *const u32 as *const c_void,
                     std::mem::size_of::<u32>() as u32,
                 );
-                // Re-assert HWND_TOPMOST (since GPUI's resize calls SetWindowPos without SWP_NOZORDER).
+                // Re-assert HWND_TOPMOST and ensure visibility without stealing foreground focus.
                 SetWindowPos(
                     hwnd,
                     HWND_TOPMOST,
@@ -257,8 +265,37 @@ pub fn strip_dwm_outer_ring() {
                     0,
                     0,
                     0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
                 );
+            }
+            1
+        }
+    }
+
+    unsafe {
+        EnumWindows(Some(callback), std::process::id() as LPARAM);
+    }
+}
+
+/// Restore any minimized regular Voicebar window (e.g. Personal Rewrite Studio minimized via "Continue later").
+#[cfg(windows)]
+pub fn restore_minimized_windows() {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GWL_EXSTYLE, GetWindowLongPtrW, GetWindowThreadProcessId, IsIconic,
+        SW_RESTORE, SetForegroundWindow, ShowWindow, WS_EX_TOOLWINDOW,
+    };
+
+    unsafe extern "system" fn callback(hwnd: HWND, target_pid: LPARAM) -> i32 {
+        unsafe {
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if pid == target_pid as u32 {
+                let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+                if (ex_style & WS_EX_TOOLWINDOW) == 0 && IsIconic(hwnd) != 0 {
+                    ShowWindow(hwnd, SW_RESTORE);
+                    SetForegroundWindow(hwnd);
+                }
             }
             1
         }
@@ -271,3 +308,6 @@ pub fn strip_dwm_outer_ring() {
 
 #[cfg(not(windows))]
 pub fn strip_dwm_outer_ring() {}
+
+#[cfg(not(windows))]
+pub fn restore_minimized_windows() {}

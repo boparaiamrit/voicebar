@@ -171,23 +171,44 @@ fn ensure_overlay_open(cx: &mut App) {
     }
 }
 
-fn ensure_settings_open(cx: &mut App) {
-    if let Some(h) = cx.global::<SettingsWindow>().0 {
-        if h.update(cx, |_, _, _| {}).is_ok() {
-            cx.global_mut::<VoiceState>().settings_open = true;
-            cx.refresh_windows();
-            return;
-        }
+fn is_settings_window_alive(cx: &mut App) -> bool {
+    let Some(h) = cx.global::<SettingsWindow>().0 else {
+        cx.global_mut::<VoiceState>().settings_open = false;
+        return false;
+    };
+    if h.update(cx, |_, _, _| {}).is_ok() {
+        true
+    } else {
         cx.global_mut::<SettingsWindow>().0 = None;
+        cx.global_mut::<VoiceState>().settings_open = false;
+        false
+    }
+}
+
+fn ensure_settings_open(cx: &mut App) {
+    if is_settings_window_alive(cx) {
+        if let Some(h) = cx.global::<SettingsWindow>().0 {
+            let _ = h.update(cx, |_, window, _| window.refresh());
+        }
+        hotkey::strip_dwm_outer_ring();
+        cx.global_mut::<VoiceState>().settings_open = true;
+        cx.refresh_windows();
+        return;
     }
 
+    let pill_open = cx.global::<OverlayWindow>().0.is_some();
     let sw = px(SETTINGS_WIDTH);
     let sh = px(SETTINGS_HEIGHT);
+    let top_y = if pill_open {
+        18. + PILL_HEIGHT + 10.
+    } else {
+        24.
+    };
     let bounds = match cx.primary_display() {
         Some(display) => {
             let vb = display.visible_bounds();
             let x = vb.origin.x + (vb.size.width - sw) / 2.0;
-            let y = vb.origin.y + px(18. + PILL_HEIGHT + 10.);
+            let y = vb.origin.y + px(top_y);
             Bounds::new(point(x, y), size(sw, sh))
         }
         None => Bounds::centered(None, size(sw, sh), cx),
@@ -196,7 +217,7 @@ fn ensure_settings_open(cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: None,
-        focus: false,
+        focus: !pill_open,
         show: true,
         kind: WindowKind::PopUp,
         is_movable: true,
@@ -210,6 +231,7 @@ fn ensure_settings_open(cx: &mut App) {
     match cx.open_window(options, |_window, cx| cx.new(|_| SettingsView)) {
         Ok(handle) => {
             hotkey::strip_dwm_outer_ring();
+            let _ = handle.update(cx, |_, window, _| window.refresh());
             cx.global_mut::<SettingsWindow>().0 = Some(handle.into());
             cx.global_mut::<VoiceState>().settings_open = true;
             cx.global_mut::<VoiceState>().auto_hide_at = None;
@@ -238,7 +260,7 @@ fn close_settings_external(cx: &mut App) {
     }
 }
 
-/// Close the settings popover directly from inside its own window `.on_click` callback.
+/// Close the settings popover directly from inside its own window callback.
 pub fn close_settings_from_window(window: &mut Window, cx: &mut App) {
     cx.global_mut::<VoiceState>().settings_open = false;
     cx.global_mut::<SettingsWindow>().0 = None;
@@ -247,7 +269,7 @@ pub fn close_settings_from_window(window: &mut Window, cx: &mut App) {
 }
 
 pub fn toggle_settings_popover(cx: &mut App) {
-    if cx.global::<VoiceState>().settings_open {
+    if is_settings_window_alive(cx) {
         close_settings_external(cx);
     } else {
         ensure_settings_open(cx);
@@ -753,7 +775,7 @@ fn handle_tray_action(cx: &mut App, action: tray::TrayAction) {
     use tray::TrayAction::*;
     match action {
         ToggleDictation => toggle_dictation(cx),
-        OpenSettings => toggle_settings_popover(cx),
+        OpenSettings => ensure_settings_open(cx),
         OpenProfileSetup => profile_setup::open(cx),
         CopyLast => {
             let last = cx.global::<VoiceState>().last_transcript.clone();
@@ -964,7 +986,7 @@ fn parse_args() -> CliArgs {
     out
 }
 
-fn apply_dark_theme(cx: &mut App) {
+pub fn apply_dark_theme(cx: &mut App) {
     Theme::change(ThemeMode::Dark, None, cx);
     let th = cx.global_mut::<Theme>();
     th.font_family = overlay::ui_font().into();

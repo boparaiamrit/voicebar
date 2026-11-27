@@ -9,10 +9,8 @@ use crate::overlay::icon;
 use crate::personalization::{
     PREVIEW_COUNT, ProfilePreview, RewritePair, SetupDraft, count_paste_entries,
 };
-use crate::{VoiceState, rewrite};
-use gpui_kit::component::button::{Button, ButtonVariants};
+use crate::{VoiceState, hotkey, rewrite};
 use gpui_kit::component::input::{Textarea, TextareaState};
-use gpui_kit::component::Disableable;
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -29,7 +27,10 @@ pub fn init(cx: &mut App) {
 pub fn open(cx: &mut App) {
     if let Some(handle) = cx.global::<SetupWindow>().0 {
         if handle
-            .update(cx, |_, window, _| window.activate_window())
+            .update(cx, |_, window, _| {
+                hotkey::restore_minimized_windows();
+                window.activate_window();
+            })
             .is_ok()
         {
             cx.activate(true);
@@ -49,6 +50,10 @@ pub fn open(cx: &mut App) {
         ..Default::default()
     };
     match gpui_kit::open_window(options, cx, |window, cx| {
+        crate::apply_dark_theme(cx);
+        window
+            .observe_window_appearance(|_window, cx| crate::apply_dark_theme(cx))
+            .detach();
         cx.new(|cx| Setup::new(window, cx))
     }) {
         Ok((handle, _)) => {
@@ -522,20 +527,112 @@ impl Setup {
 }
 
 // =========================================================================
-// Dark-glass UI building blocks
+// Dark-glass UI building blocks (explicitly colored — never white-on-white!)
 // =========================================================================
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BtnTone {
+    Primary,
+    Secondary,
+    Ghost,
+    Danger,
+}
+
+fn btn(
+    cx: &Context<Setup>,
+    id: &'static str,
+    label: &'static str,
+    tone: BtnTone,
+    disabled: bool,
+    full_width: bool,
+    handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
+) -> Stateful<Div> {
+    let (bg, bg_hover, border, fg) = match tone {
+        BtnTone::Primary => (c(0x6366f1), c(0x818cf8), ca(0x818cf890), c(0xffffff)),
+        BtnTone::Secondary => (c(0x1f1f2e), c(0x2b2b40), ca(0xffffff24), c(0xf4f4f6)),
+        BtnTone::Ghost => (ca(0x00000000), ca(0xffffff14), ca(0x00000000), c(0xd1d5db)),
+        BtnTone::Danger => (ca(0xef444428), ca(0xef444442), ca(0xf8717160), c(0xfca5a5)),
+    };
+
+    div()
+        .id(id)
+        .h(px(34.))
+        .px(px(14.))
+        .rounded(px(9.))
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(6.))
+        .text_size(px(12.5))
+        .font_weight(if tone == BtnTone::Primary {
+            FontWeight::SEMIBOLD
+        } else {
+            FontWeight::MEDIUM
+        })
+        .text_color(fg)
+        .when(full_width, |d| d.w_full())
+        .when(disabled, |d| d.opacity(0.42).cursor_default())
+        .when(!disabled, |d| {
+            d.cursor_pointer()
+                .hover(move |s| s.bg(bg_hover))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, _, window, cx| {
+                        cx.stop_propagation();
+                        handle(view, window, cx);
+                    }),
+                )
+        })
+        .child(label)
+}
 
 fn action(
     cx: &Context<Setup>,
     id: &'static str,
     label: &'static str,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
-) -> Button {
-    Button::new(id)
-        .label(label)
-        .on_click(cx.listener(move |view, _, window, cx| {
-            handle(view, window, cx);
-        }))
+) -> Stateful<Div> {
+    btn(cx, id, label, BtnTone::Secondary, false, false, handle)
+}
+
+fn action_primary(
+    cx: &Context<Setup>,
+    id: &'static str,
+    label: &'static str,
+    handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
+) -> Stateful<Div> {
+    btn(cx, id, label, BtnTone::Primary, false, false, handle)
+}
+
+fn action_primary_full(
+    cx: &Context<Setup>,
+    id: &'static str,
+    label: &'static str,
+    handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
+) -> Stateful<Div> {
+    btn(cx, id, label, BtnTone::Primary, false, true, handle)
+}
+
+fn action_secondary_full(
+    cx: &Context<Setup>,
+    id: &'static str,
+    label: &'static str,
+    handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
+) -> Stateful<Div> {
+    btn(cx, id, label, BtnTone::Secondary, false, true, handle)
+}
+
+fn action_ghost(
+    cx: &Context<Setup>,
+    id: &'static str,
+    label: &'static str,
+    handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
+) -> Stateful<Div> {
+    btn(cx, id, label, BtnTone::Ghost, false, false, handle)
 }
 
 fn col() -> Div {
@@ -837,8 +934,18 @@ impl Setup {
                                         if cfg.personal_rewrite { indigo } else { text_mid },
                                     )),
                             )
-                            .child(
-                                action(cx, "clear-profile", clear_label, |s, _, cx| {
+                            .child(btn(
+                                cx,
+                                "clear-profile",
+                                clear_label,
+                                if self.confirm_clear {
+                                    BtnTone::Danger
+                                } else {
+                                    BtnTone::Ghost
+                                },
+                                false,
+                                false,
+                                |s, _, cx| {
                                     if !s.confirm_clear {
                                         s.confirm_clear = true;
                                         cx.notify();
@@ -849,9 +956,8 @@ impl Setup {
                                         s.fail(err, cx);
                                     }
                                     cx.notify();
-                                })
-                                .ghost(),
-                            ),
+                                },
+                            )),
                     )
                     .child(pairs_preview),
             );
@@ -945,12 +1051,12 @@ impl Setup {
                         text_mid,
                     ))
                     .when(show_install, |d| {
-                        d.child(
-                            action(cx, "install-selected-llm", "Download", |s, _, cx| {
-                                s.download(cx)
-                            })
-                            .primary(),
-                        )
+                        d.child(action_primary(
+                            cx,
+                            "install-selected-llm",
+                            "Download",
+                            |s, _, cx| s.download(cx),
+                        ))
                     })
                     .on_click(cx.listener(move |view, _, _, cx| {
                         view.select_model(model, cx);
@@ -1050,12 +1156,12 @@ impl Setup {
                                             "Paste 1–50 real dictations or rough messages you chose yourself.",
                                         )),
                                 )
-                                .child(
-                                    action(cx, "start-paste", "Paste samples", |s, _, cx| {
-                                        s.show(Page::Paste, cx)
-                                    })
-                                    .primary(),
-                                ),
+                                .child(action_primary_full(
+                                    cx,
+                                    "start-paste",
+                                    "Paste samples",
+                                    |s, _, cx| s.show(Page::Paste, cx),
+                                )),
                         )
                         .child(
                             div()
@@ -1097,7 +1203,7 @@ impl Setup {
                                             "Select local coding assistants to scan read-only. Assistant replies are excluded.",
                                         )),
                                 )
-                                .child(action(
+                                .child(action_secondary_full(
                                     cx,
                                     "start-history",
                                     "Choose histories",
@@ -1152,12 +1258,12 @@ impl Setup {
                     .child(action(cx, "paste-back", "Back", |s, _, cx| {
                         s.show(Page::Start, cx)
                     }))
-                    .child(
-                        action(cx, "use-paste", "Continue to review", |s, _, cx| {
-                            s.accept_paste(cx)
-                        })
-                        .primary(),
-                    ),
+                    .child(action_primary(
+                        cx,
+                        "use-paste",
+                        "Continue to review",
+                        |s, _, cx| s.accept_paste(cx),
+                    )),
             )
     }
 
@@ -1351,12 +1457,12 @@ impl Setup {
                     .child(subtle(
                         "No supported local assistant histories were found on this machine. You can paste your own transcripts instead.",
                     ))
-                    .child(
-                        action(cx, "history-paste", "Paste samples", |s, _, cx| {
-                            s.show(Page::Paste, cx)
-                        })
-                        .primary(),
-                    ),
+                    .child(action_primary(
+                        cx,
+                        "history-paste",
+                        "Paste samples",
+                        |s, _, cx| s.show(Page::Paste, cx),
+                    )),
             );
         }
 
@@ -1369,13 +1475,15 @@ impl Setup {
                 .child(action(cx, "history-back", "Back", |s, _, cx| {
                     s.show(Page::Start, cx)
                 }))
-                .child(
-                    action(cx, "import-selected", "Import selected", |s, _, cx| {
-                        s.import(cx)
-                    })
-                    .primary()
-                    .disabled(busy || selected_count == 0),
-                ),
+                .child(btn(
+                    cx,
+                    "import-selected",
+                    "Import selected",
+                    BtnTone::Primary,
+                    busy || selected_count == 0,
+                    false,
+                    |s, _, cx| s.import(cx),
+                )),
         )
     }
 
@@ -1413,12 +1521,12 @@ impl Setup {
                 .child(action(cx, "summary-back", "Back", |s, _, cx| {
                     s.show(s.source_page, cx)
                 }))
-                .child(
-                    action(cx, "begin-review", "Start reviewing", |s, _, cx| {
-                        s.begin_review(cx)
-                    })
-                    .primary(),
-                ),
+                .child(action_primary(
+                    cx,
+                    "begin-review",
+                    "Start reviewing",
+                    |s, _, cx| s.begin_review(cx),
+                )),
         )
     }
 
@@ -1475,13 +1583,16 @@ impl Setup {
                     .child(
                         glass_card("LIGHT CLEANUP · YOUR WORDS", light, false, Some("wand"))
                             .justify_between()
-                            .child(
-                                action(cx, "use-light", "Choose light cleanup", |s, _, cx| {
+                            .child(action_secondary_full(
+                                cx,
+                                "use-light",
+                                "Choose light cleanup",
+                                |s, _, cx| {
                                     if let Some((text, _)) = &s.suggestions {
                                         s.choose(Some(text.clone()), cx);
                                     }
-                                }),
-                            ),
+                                },
+                            )),
                     )
                     .child(
                         glass_card(
@@ -1491,14 +1602,16 @@ impl Setup {
                             Some("sparkles"),
                         )
                         .justify_between()
-                        .child(
-                            action(cx, "use-natural", "Choose natural wording", |s, _, cx| {
+                        .child(action_primary_full(
+                            cx,
+                            "use-natural",
+                            "Choose natural wording",
+                            |s, _, cx| {
                                 if let Some((_, text)) = &s.suggestions {
                                     s.choose(Some(text.clone()), cx);
                                 }
-                            })
-                            .primary(),
-                        ),
+                            },
+                        )),
                     ),
             );
         } else if self.busy.is_some() {
@@ -1550,20 +1663,19 @@ impl Setup {
                     )
                     .child(
                         actions_bar()
-                            .child(
-                                action(cx, "accept-own", "Use my wording", |s, _, cx| {
+                            .child(action_primary(
+                                cx,
+                                "accept-own",
+                                "Use my wording",
+                                |s, _, cx| {
                                     let value = s.own.read(cx).value().to_string();
                                     s.choose(Some(value), cx);
-                                })
-                                .primary(),
-                            )
-                            .child(
-                                action(cx, "cancel-own", "Cancel", |s, _, cx| {
-                                    s.editing = false;
-                                    cx.notify();
-                                })
-                                .ghost(),
-                            ),
+                                },
+                            ))
+                            .child(action_ghost(cx, "cancel-own", "Cancel", |s, _, cx| {
+                                s.editing = false;
+                                cx.notify();
+                            })),
                     ),
             );
         }
@@ -1584,13 +1696,15 @@ impl Setup {
         }
         body.child(
             choices
-                .child(action(cx, "skip-sample", "Skip", |s, _, cx| s.choose(None, cx)).ghost())
-                .child(
-                    action(cx, "change-input", "Change samples", |s, _, cx| {
-                        s.show(s.source_page, cx)
-                    })
-                    .ghost(),
-                ),
+                .child(action_ghost(cx, "skip-sample", "Skip", |s, _, cx| {
+                    s.choose(None, cx)
+                }))
+                .child(action_ghost(
+                    cx,
+                    "change-input",
+                    "Change samples",
+                    |s, _, cx| s.show(s.source_page, cx),
+                )),
         )
     }
 
@@ -1664,13 +1778,15 @@ impl Setup {
                     .child(action(cx, "redo-examples", "Edit sample choices", |s, _, cx| {
                         s.restart_review(cx)
                     }))
-                    .child(
-                        action(cx, "generate-preview", "Compare rewrites", |s, _, cx| {
-                            s.compare(cx)
-                        })
-                        .primary()
-                        .disabled(busy),
-                    ),
+                    .child(btn(
+                        cx,
+                        "generate-preview",
+                        "Compare rewrites",
+                        BtnTone::Primary,
+                        busy,
+                        false,
+                        |s, _, cx| s.compare(cx),
+                    )),
             )
     }
 
@@ -1720,23 +1836,22 @@ impl Setup {
             }));
         }
         navigation = if index + 1 == preview.rewrites.len() {
-            navigation.child(
-                action(
-                    cx,
-                    "activate-profile",
-                    "Activate personal profile",
-                    |s, window, cx| s.activate(window, cx),
-                )
-                .primary(),
-            )
+            navigation.child(action_primary(
+                cx,
+                "activate-profile",
+                "Activate personal profile",
+                |s, window, cx| s.activate(window, cx),
+            ))
         } else {
-            navigation.child(
-                action(cx, "next-pair", "Next comparison", |s, _, cx| {
+            navigation.child(action_primary(
+                cx,
+                "next-pair",
+                "Next comparison",
+                |s, _, cx| {
                     s.comparison_index = (s.comparison_index + 1).min(PREVIEW_COUNT - 1);
                     cx.notify();
-                })
-                .primary(),
-            )
+                },
+            ))
         };
 
         col()
@@ -1787,18 +1902,18 @@ impl Setup {
                     .child(navigation)
                     .child(
                         actions_bar()
-                            .child(
-                                action(cx, "edit-choices", "Edit sample choices", |s, _, cx| {
-                                    s.restart_review(cx)
-                                })
-                                .ghost(),
-                            )
-                            .child(
-                                action(cx, "edit-fresh", "Change test dictations", |s, _, cx| {
-                                    s.show(Page::Fresh, cx)
-                                })
-                                .ghost(),
-                            ),
+                            .child(action_ghost(
+                                cx,
+                                "edit-choices",
+                                "Edit sample choices",
+                                |s, _, cx| s.restart_review(cx),
+                            ))
+                            .child(action_ghost(
+                                cx,
+                                "edit-fresh",
+                                "Change test dictations",
+                                |s, _, cx| s.show(Page::Fresh, cx),
+                            )),
                     ),
             )
     }
@@ -1864,15 +1979,15 @@ impl Setup {
                     .text_color(c(0x9ca3af))
                     .child("Press F1 anywhere to dictate. Voicebar applies your style locally and copies the result to your clipboard. You can switch Optional Rephrasing OFF anytime from Settings or the tray, and Copy Last Transcript always recovers the raw speech."),
             )
-            .child(
-                actions_bar().child(
-                    action(cx, "close-complete", "Done", |_, window, cx| {
-                        cx.global_mut::<SetupWindow>().0 = None;
-                        window.remove_window();
-                    })
-                    .primary(),
-                ),
-            )
+            .child(actions_bar().child(action_primary(
+                cx,
+                "close-complete",
+                "Done",
+                |_, window, cx| {
+                    cx.global_mut::<SetupWindow>().0 = None;
+                    window.remove_window();
+                },
+            )))
     }
 }
 
@@ -1998,13 +2113,10 @@ impl Render for Setup {
                                         .child(status.clone()),
                                 ),
                         )
-                        .child(
-                            action(cx, "cancel-busy-job", "Cancel", |s, _, cx| {
-                                s.stop_job();
-                                cx.notify();
-                            })
-                            .ghost(),
-                        ),
+                        .child(action_ghost(cx, "cancel-busy-job", "Cancel", |s, _, cx| {
+                            s.stop_job();
+                            cx.notify();
+                        })),
                 );
             if let Some(p) = pull {
                 let pct = (p.fraction() * 100.0).round() as u32;
@@ -2084,12 +2196,12 @@ impl Render for Setup {
                         ),
                 );
             if is_missing {
-                notice = notice.child(
-                    action(cx, "get-model", "Download model", |s, _, cx| {
-                        s.download(cx)
-                    })
-                    .primary(),
-                );
+                notice = notice.child(action_primary(
+                    cx,
+                    "get-model",
+                    "Download model",
+                    |s, _, cx| s.download(cx),
+                ));
             }
             contents = contents.child(notice);
         }
@@ -2199,25 +2311,22 @@ impl Render for Setup {
                             "Rephrasing: OFF"
                         }),
                 )
-                .on_click(|_, _, cx| crate::toggle_personal_rewrite_from_ui(cx)),
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                    crate::toggle_personal_rewrite_from_ui(cx);
+                }),
         );
 
         if self.page != Page::Done {
             right_bar = right_bar
-                .child(
-                    action(cx, "continue-later", "Continue later", |_, window, _| {
-                        window.minimize_window();
-                    })
-                    .tooltip("Minimize and resume anytime from Voicebar’s tray."),
-                )
-                .child(
-                    action(cx, "discard-setup", "Close", |s, window, cx| {
-                        s.stop_job();
-                        cx.global_mut::<SetupWindow>().0 = None;
-                        window.remove_window();
-                    })
-                    .ghost(),
-                );
+                .child(action(cx, "continue-later", "Continue later", |_, window, _| {
+                    window.minimize_window();
+                }))
+                .child(action_ghost(cx, "discard-setup", "Close", |s, window, cx| {
+                    s.stop_job();
+                    cx.global_mut::<SetupWindow>().0 = None;
+                    window.remove_window();
+                }));
         }
 
         header = header.child(right_bar);

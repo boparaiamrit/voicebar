@@ -491,6 +491,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
     };
 
     // Right controls: minimal 2-icon cluster (Settings/Models popover + guaranteed instant Close).
+    // Uses on_mouse_down + cx.defer so the very first click on an unfocused popup always fires immediately.
     let right_controls = div()
         .flex()
         .flex_row()
@@ -522,7 +523,10 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     13.5,
                     if settings_open { indigo } else { text_mid },
                 ))
-                .on_click(|_, _, cx| toggle_settings_popover(cx)),
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.defer(toggle_settings_popover);
+                }),
         )
         .child(
             div()
@@ -536,7 +540,8 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                 .cursor_pointer()
                 .hover(|s| s.bg(ca(0xf871712a)))
                 .child(icon("x", 13.5, text_mid))
-                .on_click(|_, window, cx| {
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    cx.stop_propagation();
                     let is_active = matches!(
                         cx.global::<VoiceState>().phase,
                         Phase::Listening { .. } | Phase::Loading { .. } | Phase::Downloading { .. }
@@ -656,7 +661,10 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                 .cursor_pointer()
                 .hover(|s| s.bg(ca(0xffffff18)))
                 .child(icon("x", 13., text_mid))
-                .on_click(|_, window, cx| close_settings_from_window(window, cx)),
+                .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    cx.stop_propagation();
+                    close_settings_from_window(window, cx);
+                }),
         );
 
     let models_header = div()
@@ -740,7 +748,10 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                             format!("↓ {}", kind.size_label())
                         }),
                 )
-                .on_click(move |_, window, cx| select_model_from_settings(window, cx, kind))
+                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                    cx.stop_propagation();
+                    select_model_from_settings(window, cx, kind);
+                })
         }));
 
     // Spoken language row
@@ -804,7 +815,10 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                             .cursor_pointer()
                             .hover(|s| s.bg(ca(0xffffff14)))
                             .child(label)
-                            .on_click(move |_, _, cx| select_language_from_settings(cx, code))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                select_language_from_settings(cx, code);
+                            })
                     })),
             )
     } else {
@@ -899,8 +913,13 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                         ),
                 )
                 .child(
-                    pill_switch("tog-rewrite", rewrite_on)
-                        .on_click(|_, _, cx| toggle_personal_rewrite_from_ui(cx)),
+                    pill_switch("tog-rewrite", rewrite_on).on_mouse_down(
+                        MouseButton::Left,
+                        |_, _, cx| {
+                            cx.stop_propagation();
+                            toggle_personal_rewrite_from_ui(cx);
+                        },
+                    ),
                 ),
         )
         .when(!rewrite_on, |card| {
@@ -939,7 +958,8 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                             } else {
                                 "Set up…"
                             })
-                            .on_click(|_, window, cx| {
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
                                 close_settings_from_window(window, cx);
                                 cx.defer(crate::profile_setup::open);
                             }),
@@ -1015,7 +1035,10 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                                     }),
                             )
                             .child(icon("chevron-right", 12., text_dim))
-                            .on_click(move |_, _, cx| select_rewrite_model_from_ui(cx, next_model)),
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                select_rewrite_model_from_ui(cx, next_model);
+                            }),
                     )
                     .child(
                         div()
@@ -1040,7 +1063,8 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                                     .text_color(text_hi)
                                     .child(if has_profile { "Profile" } else { "Set up" }),
                             )
-                            .on_click(|_, window, cx| {
+                            .on_mouse_down(MouseButton::Left, |_, window, cx| {
+                                cx.stop_propagation();
                                 close_settings_from_window(window, cx);
                                 cx.defer(crate::profile_setup::open);
                             }),
@@ -1089,8 +1113,9 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
                                     .cursor_pointer()
                                     .hover(|s| s.bg(ca(0xffffff14)))
                                     .child(label)
-                                    .on_click(move |_, _, cx| {
-                                        select_rewrite_language_from_ui(cx, code)
+                                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                        cx.stop_propagation();
+                                        select_rewrite_language_from_ui(cx, code);
                                     })
                             })),
                     ),
@@ -1138,15 +1163,31 @@ pub fn render_settings_popover(cx: &mut App) -> AnyElement {
         .flex_row()
         .gap(px(6.))
         .child(
-            toggle_chip("tog-paste", "Auto-Paste", cfg.auto_paste)
-                .on_click(|_, _, cx| toggle_auto_paste_from_ui(cx)),
+            toggle_chip("tog-paste", "Auto-Paste", cfg.auto_paste).on_mouse_down(
+                MouseButton::Left,
+                |_, _, cx| {
+                    cx.stop_propagation();
+                    toggle_auto_paste_from_ui(cx);
+                },
+            ),
         )
         .child(
-            toggle_chip("tog-boot", "At Sign-In", autostart)
-                .on_click(|_, _, cx| toggle_autostart_from_ui(cx)),
+            toggle_chip("tog-boot", "At Sign-In", autostart).on_mouse_down(
+                MouseButton::Left,
+                |_, _, cx| {
+                    cx.stop_propagation();
+                    toggle_autostart_from_ui(cx);
+                },
+            ),
         )
         .child(
-            toggle_chip("tog-gpu", "GPU", cfg.use_gpu).on_click(|_, _, cx| toggle_gpu_from_ui(cx)),
+            toggle_chip("tog-gpu", "GPU", cfg.use_gpu).on_mouse_down(
+                MouseButton::Left,
+                |_, _, cx| {
+                    cx.stop_propagation();
+                    toggle_gpu_from_ui(cx);
+                },
+            ),
         );
 
     div()
