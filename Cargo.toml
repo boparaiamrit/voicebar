@@ -1,6 +1,6 @@
 [package]
 name = "voicebar"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "Fast, native local GPU voice dictation for Windows, macOS and Linux — always-on-top floating pill with NVIDIA Nemotron and Parakeet streaming."
 license = "MIT"

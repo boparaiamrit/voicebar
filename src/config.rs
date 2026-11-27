@@ -205,17 +205,21 @@ impl ModelKind {
 
 /// Optional local Ollama text-only model used when Personal Rewrite is turned ON.
 /// Strictly text-only models (no vision towers or tool overhead) for low-latency cleanup,
-/// including Sarvam AI's open-weight Indian-language models.
+/// including ultra-tiny sub-1GB models and Sarvam AI's open-weight Indian-language models.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum RewriteModel {
-    /// Qwen 3 4B (text-only, no vision): fast English, Hindi & Hinglish cleanup (fits 8 GB GPU).
-    #[default]
-    Qwen3_4b,
+    /// Qwen 3 0.6B (text-only): ultra-tiny (~520 MB), instant on any CPU or low-VRAM GPU.
+    Qwen3_0_6b,
+    /// Qwen 2.5 1.5B (text-only, zero thinking): fast small English & Hinglish cleanup (~986 MB).
+    Qwen25_1_5b,
     /// Qwen 3 1.7B (text-only, no vision): ultra-fast low-VRAM cleanup (~1.4 GB).
     Qwen3_1_7b,
     /// Qwen 2.5 3B (text-only, no thinking overhead): instant Hinglish & Indian English cleanup (~1.9 GB).
     Qwen25_3b,
+    /// Qwen 3 4B (text-only, no vision): balanced English, Hindi & Hinglish cleanup (fits 8 GB GPU).
+    #[default]
+    Qwen3_4b,
     /// Sarvam Translate 4B (Sarvam AI, text-only GGUF): 22 Indian languages translation (fits 8 GB GPU).
     SarvamTranslate4b,
     /// Sarvam M 24B (Sarvam AI, Apache 2.0, text-only): 11 Indian languages + Indian English (16 GB+ RAM/VRAM).
@@ -223,19 +227,23 @@ pub enum RewriteModel {
 }
 
 impl RewriteModel {
-    pub const ALL: [RewriteModel; 5] = [
-        RewriteModel::Qwen3_4b,
+    pub const ALL: [RewriteModel; 7] = [
+        RewriteModel::Qwen3_0_6b,
+        RewriteModel::Qwen25_1_5b,
         RewriteModel::Qwen3_1_7b,
         RewriteModel::Qwen25_3b,
+        RewriteModel::Qwen3_4b,
         RewriteModel::SarvamTranslate4b,
         RewriteModel::SarvamM24b,
     ];
 
     pub fn ollama_tag(self) -> &'static str {
         match self {
-            RewriteModel::Qwen3_4b => "qwen3:4b",
+            RewriteModel::Qwen3_0_6b => "qwen3:0.6b",
+            RewriteModel::Qwen25_1_5b => "qwen2.5:1.5b",
             RewriteModel::Qwen3_1_7b => "qwen3:1.7b",
             RewriteModel::Qwen25_3b => "qwen2.5:3b",
+            RewriteModel::Qwen3_4b => "qwen3:4b",
             RewriteModel::SarvamTranslate4b => "hf.co/mradermacher/sarvam-translate-GGUF:Q4_K_M",
             RewriteModel::SarvamM24b => "hf.co/bartowski/sarvamai_sarvam-m-GGUF:Q4_K_M",
         }
@@ -243,9 +251,11 @@ impl RewriteModel {
 
     pub fn display_name(self) -> &'static str {
         match self {
-            RewriteModel::Qwen3_4b => "Qwen 3 · 4B",
+            RewriteModel::Qwen3_0_6b => "Qwen 3 · 0.6B",
+            RewriteModel::Qwen25_1_5b => "Qwen 2.5 · 1.5B",
             RewriteModel::Qwen3_1_7b => "Qwen 3 · 1.7B",
             RewriteModel::Qwen25_3b => "Qwen 2.5 · 3B",
+            RewriteModel::Qwen3_4b => "Qwen 3 · 4B",
             RewriteModel::SarvamTranslate4b => "Sarvam Translate · 4B",
             RewriteModel::SarvamM24b => "Sarvam M · 24B",
         }
@@ -253,9 +263,11 @@ impl RewriteModel {
 
     pub fn short_label(self) -> &'static str {
         match self {
-            RewriteModel::Qwen3_4b => "Qwen 3 4B",
+            RewriteModel::Qwen3_0_6b => "Qwen 3 0.6B",
+            RewriteModel::Qwen25_1_5b => "Qwen 2.5 1.5B",
             RewriteModel::Qwen3_1_7b => "Qwen 3 1.7B",
             RewriteModel::Qwen25_3b => "Qwen 2.5 3B",
+            RewriteModel::Qwen3_4b => "Qwen 3 4B",
             RewriteModel::SarvamTranslate4b => "Sarvam 4B",
             RewriteModel::SarvamM24b => "Sarvam M",
         }
@@ -263,28 +275,39 @@ impl RewriteModel {
 
     pub fn subtitle(self) -> &'static str {
         match self {
-            RewriteModel::Qwen3_4b => "Text-only · fast English, Hindi & Hinglish · no vision overhead",
-            RewriteModel::Qwen3_1_7b => "Text-only · ultra-fast low-VRAM cleanup · 119 languages",
-            RewriteModel::Qwen25_3b => "Text-only · instant Hinglish & Indian English · zero thinking",
-            RewriteModel::SarvamTranslate4b => "Sarvam AI · text-only · 22 Indian languages translation · 8 GB GPU",
-            RewriteModel::SarvamM24b => "Sarvam AI · text-only · Indian languages & English · 16 GB+ RAM",
+            RewriteModel::Qwen3_0_6b => "Ultra-tiny · instant CPU/GPU cleanup · safe with 6–8 GB VRAM",
+            RewriteModel::Qwen25_1_5b => "Small & snappy · English & Hinglish · zero thinking delay",
+            RewriteModel::Qwen3_1_7b => "Fast low-VRAM text cleanup · 119 languages",
+            RewriteModel::Qwen25_3b => "Instant Hinglish & Indian English · zero thinking",
+            RewriteModel::Qwen3_4b => "Balanced accuracy · English, Hindi & Hinglish · 8 GB GPU",
+            RewriteModel::SarvamTranslate4b => "Sarvam AI · 22 Indian languages translation · 8 GB GPU",
+            RewriteModel::SarvamM24b => "Sarvam AI · Indian languages & English · 16 GB+ RAM",
         }
     }
 
     pub fn size_label(self) -> &'static str {
         match self {
-            RewriteModel::Qwen3_4b => "~2.5 GB",
+            RewriteModel::Qwen3_0_6b => "~520 MB",
+            RewriteModel::Qwen25_1_5b => "~986 MB",
             RewriteModel::Qwen3_1_7b => "~1.4 GB",
             RewriteModel::Qwen25_3b => "~1.9 GB",
+            RewriteModel::Qwen3_4b => "~2.5 GB",
             RewriteModel::SarvamTranslate4b => "~2.5 GB",
             RewriteModel::SarvamM24b => "~14.5 GB",
         }
     }
 
+    pub fn is_small_fast(self) -> bool {
+        matches!(self, RewriteModel::Qwen3_0_6b | RewriteModel::Qwen25_1_5b)
+    }
+
     pub fn is_indic_focused(self) -> bool {
         matches!(
             self,
-            RewriteModel::SarvamTranslate4b | RewriteModel::SarvamM24b | RewriteModel::Qwen25_3b
+            RewriteModel::SarvamTranslate4b
+                | RewriteModel::SarvamM24b
+                | RewriteModel::Qwen25_3b
+                | RewriteModel::Qwen25_1_5b
         )
     }
 
@@ -733,7 +756,11 @@ mod tests {
         assert!(decoded.rewrite_profile.is_none());
         assert!(!decoded.has_valid_profile());
         assert_eq!(decoded.rewrite_model, RewriteModel::Qwen3_4b);
-        assert_eq!(RewriteModel::ALL.len(), 5);
+        assert_eq!(RewriteModel::ALL.len(), 7);
+        assert!(RewriteModel::Qwen3_0_6b.is_small_fast());
+        assert!(RewriteModel::Qwen25_1_5b.is_small_fast());
+        assert_eq!(RewriteModel::Qwen3_0_6b.ollama_tag(), "qwen3:0.6b");
+        assert_eq!(RewriteModel::Qwen25_1_5b.ollama_tag(), "qwen2.5:1.5b");
     }
 
     #[test]

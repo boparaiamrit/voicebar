@@ -478,12 +478,23 @@ pub fn read_selected_cancellable(sources: &[Source], cancel: &AtomicBool) -> Opt
         let mut seen = HashSet::new();
         let (mut eligible_count, mut errors, mut skipped, mut over_limit) = (0, 0, 0, 0);
         let (mut long_text, mut excluded) = (0, 0);
+        let mut checked_files = 0usize;
+        const EARLY_STOP_MIN_FILES: usize = 80;
         for (_, path) in recent {
             if cancel.load(Ordering::Acquire) {
                 return None;
             }
+            // Once we already collected the full sample budget from the newest sessions,
+            // stop parsing hundreds of older multi-MB rollout logs so import finishes in <1s.
+            if kept.len() >= MAX_ENTRIES && checked_files >= EARLY_STOP_MIN_FILES {
+                break;
+            }
+            checked_files += 1;
             let mut file_entries = VecDeque::new();
             let result = read_file(source.label, path, &mut |message| {
+                if cancel.load(Ordering::Acquire) {
+                    return;
+                }
                 if let Some(text) = eligible(message) {
                     eligible_count += 1;
                     if kept.len() == MAX_ENTRIES {
@@ -517,8 +528,13 @@ pub fn read_selected_cancellable(sources: &[Source], cancel: &AtomicBool) -> Opt
             }
         }
         let origin = if source.is_voice() { "voice" } else { "chat" };
+        let files_note = if checked_files < count {
+            format!("{checked_files} newest of {count} files checked")
+        } else {
+            format!("{count} files checked")
+        };
         let mut summary = format!(
-            "{} ({origin}) {eligible_count} eligible records, {count} files checked",
+            "{} ({origin}) {eligible_count} eligible records, {files_note}",
             source.label
         );
         if skipped > 0 {

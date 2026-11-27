@@ -21,6 +21,10 @@ pub enum EngineCommand {
     Prepare(AppConfig),
     /// Start capturing microphone audio and streaming live transcription.
     StartDictation(AppConfig),
+    /// Pause microphone capture while keeping accumulated transcript & model state intact.
+    PauseDictation,
+    /// Resume microphone capture into the same dictation session.
+    ResumeDictation,
     /// Stop capturing, flush trailing audio through the cache, and emit final transcript.
     StopDictation,
     /// Stop capturing immediately and discard transcript.
@@ -42,6 +46,9 @@ pub enum EngineEvent {
     Listening {
         mic_name: String,
         gpu: bool,
+    },
+    Paused {
+        mic_name: String,
     },
     TranscriptUpdate {
         text: String,
@@ -408,6 +415,8 @@ fn worker_loop(
     #[allow(unused_assignments)]
     let mut _mic: Option<MicCapture> = None;
     let mut dictating = false;
+    let mut paused = false;
+    let mut last_mic_name = String::new();
     let mut latest_text = String::new();
 
     loop {
@@ -420,16 +429,17 @@ fn worker_loop(
         match cmd_rx.recv_timeout(poll_timeout) {
             Ok(EngineCommand::Shutdown) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Ok(EngineCommand::Prepare(cfg)) => {
-                if dictating {
+                if dictating || paused {
                     _mic = None;
                     dictating = false;
+                    paused = false;
                 }
                 if let Err(e) = ensure_loaded(&mut loaded, &cfg, &ev_tx) {
                     let _ = ev_tx.send(EngineEvent::Error(e));
                 }
             }
             Ok(EngineCommand::StartDictation(cfg)) => {
-                if dictating {
+                if dictating || paused {
                     continue;
                 }
                 if let Err(e) = ensure_loaded(&mut loaded, &cfg, &ev_tx) {
@@ -461,8 +471,10 @@ fn worker_loop(
                 match MicCapture::start(audio.clone()) {
                     Ok(capture) => {
                         let mic_name = capture.device_name.clone();
+                        last_mic_name = mic_name.clone();
                         _mic = Some(capture);
                         dictating = true;
+                        paused = false;
                         let gpu = loaded.as_ref().map(|m| m.gpu).unwrap_or(false);
                         let _ = ev_tx.send(EngineEvent::Listening { mic_name, gpu });
                     }
@@ -471,9 +483,59 @@ fn worker_loop(
                     }
                 }
             }
+            Ok(EngineCommand::PauseDictation) => {
+                if !dictating || paused {
+                    continue;
+                }
+                _mic = None;
+                dictating = false;
+                paused = true;
+                // Process any buffered samples captured just before Pause without resetting the model.
+                if let Some(m) = loaded.as_mut() {
+                    let tail = audio.drain_all();
+                    let step = m.chunk_samples();
+                    for piece in tail.chunks(step) {
+                        if piece.len() >= 160 {
+                            if let Ok(t) = m.feed_chunk(piece) {
+                                latest_text = t.clone();
+                                let _ = ev_tx.send(EngineEvent::TranscriptUpdate {
+                                    text: t,
+                                    last_chunk_ms: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+                audio.clear();
+                let _ = ev_tx.send(EngineEvent::Paused {
+                    mic_name: last_mic_name.clone(),
+                });
+            }
+            Ok(EngineCommand::ResumeDictation) => {
+                if !paused || dictating {
+                    continue;
+                }
+                audio.clear();
+                match MicCapture::start(audio.clone()) {
+                    Ok(capture) => {
+                        let mic_name = capture.device_name.clone();
+                        last_mic_name = mic_name.clone();
+                        _mic = Some(capture);
+                        dictating = true;
+                        paused = false;
+                        let gpu = loaded.as_ref().map(|m| m.gpu).unwrap_or(false);
+                        let _ = ev_tx.send(EngineEvent::Listening { mic_name, gpu });
+                    }
+                    Err(e) => {
+                        paused = false;
+                        let _ = ev_tx.send(EngineEvent::Error(e));
+                    }
+                }
+            }
             Ok(EngineCommand::CancelDictation) => {
                 _mic = None;
                 dictating = false;
+                paused = false;
                 audio.clear();
                 latest_text.clear();
                 if let Some(m) = loaded.as_mut() {
@@ -482,11 +544,12 @@ fn worker_loop(
                 let _ = ev_tx.send(EngineEvent::Cancelled);
             }
             Ok(EngineCommand::StopDictation) => {
-                if !dictating {
+                if !dictating && !paused {
                     continue;
                 }
                 _mic = None;
                 dictating = false;
+                paused = false;
                 let _ = ev_tx.send(EngineEvent::Finalizing);
 
                 if let Some(m) = loaded.as_mut() {
@@ -530,16 +593,28 @@ fn worker_loop(
                         Err(e) => {
                             _mic = None;
                             dictating = false;
+                            paused = false;
                             let _ = ev_tx.send(EngineEvent::Error(e));
                             break;
                         }
                     }
-                    // Yield immediately if the user hit Stop/Cancel mid-drain.
+                    // Yield immediately if the user hit Pause/Stop/Cancel mid-drain.
                     if let Ok(cmd) = cmd_rx.try_recv() {
                         match cmd {
+                            EngineCommand::PauseDictation => {
+                                _mic = None;
+                                dictating = false;
+                                paused = true;
+                                audio.clear();
+                                let _ = ev_tx.send(EngineEvent::Paused {
+                                    mic_name: last_mic_name.clone(),
+                                });
+                                break;
+                            }
                             EngineCommand::CancelDictation => {
                                 _mic = None;
                                 dictating = false;
+                                paused = false;
                                 audio.clear();
                                 latest_text.clear();
                                 m.reset();
@@ -549,6 +624,7 @@ fn worker_loop(
                             EngineCommand::StopDictation => {
                                 _mic = None;
                                 dictating = false;
+                                paused = false;
                                 let _ = ev_tx.send(EngineEvent::Finalizing);
                                 let tail = audio.drain_all();
                                 for piece in tail.chunks(need) {

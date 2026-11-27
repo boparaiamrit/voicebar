@@ -55,6 +55,9 @@ pub enum Phase {
     Listening {
         mic_name: String,
     },
+    Paused {
+        mic_name: String,
+    },
     Finalizing,
     Copied {
         text: String,
@@ -329,6 +332,50 @@ pub fn cancel_dictation_from_window(window: &mut Window, cx: &mut App) {
     dismiss_overlay_from_window(window, cx);
 }
 
+pub fn toggle_pause_dictation(cx: &mut App) {
+    let phase = cx.global::<VoiceState>().phase.clone();
+    match phase {
+        Phase::Listening { mic_name } => {
+            cx.global_mut::<VoiceState>().phase = Phase::Paused { mic_name };
+            cx.global_mut::<VoiceState>().waveform = [0.10; WAVEFORM_BARS];
+            let _ = cx
+                .global::<EngineGlobal>()
+                .0
+                .tx
+                .send(EngineCommand::PauseDictation);
+            sync_tray(cx);
+            cx.refresh_windows();
+        }
+        Phase::Paused { mic_name } => {
+            cx.global_mut::<VoiceState>().phase = Phase::Listening { mic_name };
+            let _ = cx
+                .global::<EngineGlobal>()
+                .0
+                .tx
+                .send(EngineCommand::ResumeDictation);
+            sync_tray(cx);
+            cx.refresh_windows();
+        }
+        _ => {}
+    }
+}
+
+pub fn finish_dictation_from_window(cx: &mut App) {
+    if matches!(
+        cx.global::<VoiceState>().phase,
+        Phase::Listening { .. } | Phase::Paused { .. }
+    ) {
+        close_settings_external(cx);
+        cx.global_mut::<VoiceState>().phase = Phase::Finalizing;
+        let _ = cx
+            .global::<EngineGlobal>()
+            .0
+            .tx
+            .send(EngineCommand::StopDictation);
+        cx.refresh_windows();
+    }
+}
+
 // =========================================================================
 // Actions triggered from Settings Popover / Pill / Hotkey / Tray
 // =========================================================================
@@ -336,7 +383,10 @@ pub fn cancel_dictation_from_window(window: &mut Window, cx: &mut App) {
 pub fn select_model_from_settings(window: &mut Window, cx: &mut App, kind: ModelKind) {
     let was_active = matches!(
         cx.global::<VoiceState>().phase,
-        Phase::Listening { .. } | Phase::Loading { .. } | Phase::Downloading { .. }
+        Phase::Listening { .. }
+            | Phase::Paused { .. }
+            | Phase::Loading { .. }
+            | Phase::Downloading { .. }
     );
     let already_selected = cx.global::<VoiceState>().config.model == kind;
     close_settings_from_window(window, cx);
@@ -389,7 +439,10 @@ pub fn select_language_from_settings(cx: &mut App, code: &str) {
         st.config.clone()
     };
     sync_tray(cx);
-    let was_listening = matches!(cx.global::<VoiceState>().phase, Phase::Listening { .. });
+    let was_listening = matches!(
+        cx.global::<VoiceState>().phase,
+        Phase::Listening { .. } | Phase::Paused { .. }
+    );
     if was_listening {
         {
             let st = cx.global_mut::<VoiceState>();
@@ -520,7 +573,7 @@ pub fn toggle_dictation(cx: &mut App) {
     close_settings_external(cx);
     let phase = cx.global::<VoiceState>().phase.clone();
     match phase {
-        Phase::Listening { .. } => {
+        Phase::Listening { .. } | Phase::Paused { .. } => {
             cx.global_mut::<VoiceState>().phase = Phase::Finalizing;
             let _ = cx
                 .global::<EngineGlobal>()
@@ -587,21 +640,24 @@ fn sync_tray(cx: &mut App) {
         let st = cx.global::<VoiceState>();
         let mood = if matches!(st.phase, Phase::Listening { .. }) {
             TrayMood::Recording
-        } else if !st.model_loaded {
+        } else if matches!(st.phase, Phase::Paused { .. }) || !st.model_loaded {
             TrayMood::Warming
         } else {
             TrayMood::Ready
         };
-        let tip = match mood {
-            TrayMood::Recording if st.config.personal_rewrite => {
+        let tip = match (&st.phase, mood) {
+            (Phase::Paused { .. }, _) => {
+                "Voicebar · Paused (click Resume or press F1 to paste)".to_string()
+            }
+            (_, TrayMood::Recording) if st.config.personal_rewrite => {
                 "Voicebar · Listening (F1 to rewrite & copy)".to_string()
             }
-            TrayMood::Recording => "Voicebar · Listening (F1 to stop & paste)".to_string(),
-            TrayMood::Warming => format!(
+            (_, TrayMood::Recording) => "Voicebar · Listening (F1 to stop & paste)".to_string(),
+            (_, TrayMood::Warming) => format!(
                 "Voicebar · Preloading {} on GPU…",
                 st.config.model.short_badge()
             ),
-            TrayMood::Ready => format!(
+            (_, TrayMood::Ready) => format!(
                 "Voicebar · {} ({}) · Ready · Press F1",
                 st.config.model.short_badge(),
                 st.backend_label
@@ -740,12 +796,22 @@ fn handle_engine_event(cx: &mut App, ev: EngineEvent) {
             ensure_overlay_open(cx);
             sync_tray(cx);
         }
+        EngineEvent::Paused { mic_name } => {
+            let st = cx.global_mut::<VoiceState>();
+            st.phase = Phase::Paused { mic_name };
+            st.waveform = [0.10; WAVEFORM_BARS];
+            st.auto_hide_at = None;
+            sync_tray(cx);
+        }
         EngineEvent::TranscriptUpdate { text, .. } => {
             cx.global_mut::<VoiceState>().live_text = text;
         }
         EngineEvent::Finalizing => {
             // Ignore notifications for dictations dismissed before the worker flushed.
-            if matches!(cx.global::<VoiceState>().phase, Phase::Listening { .. }) {
+            if matches!(
+                cx.global::<VoiceState>().phase,
+                Phase::Listening { .. } | Phase::Paused { .. }
+            ) {
                 cx.global_mut::<VoiceState>().phase = Phase::Finalizing;
             }
         }
@@ -931,6 +997,12 @@ fn parse_args() -> CliArgs {
             "--rewrite-model" if i + 1 < args.len() => {
                 i += 1;
                 match args[i].to_lowercase().as_str() {
+                    "qwen3-0.6b" | "0.6b" | "tiny" => {
+                        out.rewrite_model = Some(RewriteModel::Qwen3_0_6b)
+                    }
+                    "qwen2.5-1.5b" | "1.5b" | "small" => {
+                        out.rewrite_model = Some(RewriteModel::Qwen25_1_5b)
+                    }
                     "qwen3" | "qwen3-4b" | "4b" => out.rewrite_model = Some(RewriteModel::Qwen3_4b),
                     "qwen3-1.7b" | "1.7b" | "fast" => {
                         out.rewrite_model = Some(RewriteModel::Qwen3_1_7b)

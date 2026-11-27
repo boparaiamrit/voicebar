@@ -6,18 +6,18 @@ use crate::audio::WAVEFORM_BARS;
 use crate::config::{ModelKind, is_model_ready};
 use crate::{
     Phase, VoiceState, cancel_dictation_from_window, close_settings_from_window,
-    dismiss_overlay_from_window, select_language_from_settings, select_model_from_settings,
-    select_rewrite_language_from_ui, select_rewrite_model_from_ui, toggle_auto_paste_from_ui,
-    toggle_autostart_from_ui, toggle_gpu_from_ui, toggle_personal_rewrite_from_ui,
-    toggle_settings_popover,
+    dismiss_overlay_from_window, finish_dictation_from_window, select_language_from_settings,
+    select_model_from_settings, select_rewrite_language_from_ui, select_rewrite_model_from_ui,
+    toggle_auto_paste_from_ui, toggle_autostart_from_ui, toggle_gpu_from_ui,
+    toggle_pause_dictation, toggle_personal_rewrite_from_ui, toggle_settings_popover,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::*;
 
-pub const PILL_WIDTH: f32 = 548.0;
+pub const PILL_WIDTH: f32 = 596.0;
 pub const PILL_HEIGHT: f32 = 68.0;
 pub const SETTINGS_WIDTH: f32 = 404.0;
-pub const SETTINGS_HEIGHT: f32 = 496.0;
+pub const SETTINGS_HEIGHT: f32 = 504.0;
 
 fn c(x: u32) -> Hsla {
     rgb(x).into()
@@ -117,6 +117,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
 
     let border = match &phase {
         Phase::Listening { .. } => ca(0x818cf855),
+        Phase::Paused { .. } => ca(0xfbbf2470),
         Phase::Loading { .. } | Phase::Downloading { .. } => ca(0x818cf842),
         Phase::Finalizing if is_rewriting => ca(0xa78bfa55),
         Phase::Copied { .. } if fell_back => ca(0xfbbf2466),
@@ -186,6 +187,17 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     .when(!pulse_on, |d| d.opacity(0.4)),
             )
             .child(live_waveform(bars, indigo, violet))
+            .into_any_element(),
+        Phase::Paused { .. } => div()
+            .id("pill-drag-paused")
+            .h_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.))
+            .window_control_area(WindowControlArea::Drag)
+            .child(div().size(px(8.)).rounded_full().bg(amber))
+            .child(paused_waveform(amber))
             .into_any_element(),
         Phase::Loading { .. } | Phase::Finalizing => div()
             .id("pill-drag-load")
@@ -269,7 +281,8 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     .child(
                         div()
                             .text_size(px(14.))
-                            .text_color(text_mid)
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_hi)
                             .child("Listening…"),
                     )
                     .child(
@@ -296,7 +309,7 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                             .child(
                                 div()
                                     .text_size(px(11.))
-                                    .text_color(if cfg.personal_rewrite { indigo } else { text_dim })
+                                    .text_color(if cfg.personal_rewrite { indigo } else { text_mid })
                                     .child(if cfg.personal_rewrite {
                                         "F1 · Rewrite"
                                     } else if cfg.auto_paste {
@@ -306,9 +319,16 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                                     }),
                             ),
                     )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(text_dim)
+                            .truncate()
+                            .child(cfg.model.short_badge()),
+                    )
                     .into_any_element()
             } else {
-                let (clipped, shown) = visible_tail(&transcript, 118);
+                let (clipped, shown) = visible_tail(&transcript, 108);
                 let display = if clipped {
                     format!("… {shown}")
                 } else {
@@ -326,13 +346,64 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     .child(
                         div()
                             .w_full()
-                            .text_size(px(14.5))
+                            .text_size(px(14.))
                             .line_height(px(20.))
                             .text_color(text_hi)
                             .child(format!("{display}{}", if pulse_on { " ▍" } else { "" })),
                     )
                     .into_any_element()
             }
+        }
+        Phase::Paused { .. } => {
+            let preview = if transcript.trim().is_empty() {
+                "Mic paused · click Resume or press F1".to_string()
+            } else {
+                let (clipped, shown) = visible_tail(&transcript, 74);
+                if clipped {
+                    format!("… {shown}")
+                } else {
+                    shown
+                }
+            };
+            div()
+                .id("pill-drag-paused-txt")
+                .flex_1()
+                .min_w(px(0.))
+                .h_full()
+                .overflow_hidden()
+                .window_control_area(WindowControlArea::Drag)
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .flex_none()
+                        .px(px(7.))
+                        .py(px(2.))
+                        .rounded(px(6.))
+                        .bg(ca(0xfbbf2424))
+                        .border_1()
+                        .border_color(ca(0xfbbf2455))
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(amber)
+                        .child("Paused"),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_size(px(13.))
+                        .text_color(if transcript.trim().is_empty() {
+                            text_mid
+                        } else {
+                            text_hi
+                        })
+                        .truncate()
+                        .child(preview),
+                )
+                .into_any_element()
         }
         Phase::Loading { stage } => div()
             .id("pill-drag-stage")
@@ -490,13 +561,99 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
             .into_any_element(),
     };
 
-    // Right controls: minimal 2-icon cluster (Settings/Models popover + guaranteed instant Close).
+    // Right controls: Pause/Resume (while dictating), Paste/Done, Settings popover, and Cancel/Close.
     // Uses on_mouse_down + cx.defer so the very first click on an unfocused popup always fires immediately.
-    let right_controls = div()
+    let is_listening = matches!(phase, Phase::Listening { .. });
+    let is_paused = matches!(phase, Phase::Paused { .. });
+
+    let mut right_controls = div()
+        .flex_none()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(4.))
+        .gap(px(5.));
+
+    if is_listening {
+        right_controls = right_controls.child(
+            div()
+                .id("pill-pause-btn")
+                .h(px(28.))
+                .px(px(10.))
+                .rounded_full()
+                .bg(ca(0xfbbf241c))
+                .border_1()
+                .border_color(ca(0xfbbf244a))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(5.))
+                .cursor_pointer()
+                .hover(|s| s.bg(ca(0xfbbf2430)))
+                .child(icon("pause", 12., amber))
+                .child(
+                    div()
+                        .text_size(px(11.5))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(c(0xfef3c7))
+                        .child("Pause"),
+                )
+                .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                    cx.stop_propagation();
+                    cx.defer(toggle_pause_dictation);
+                }),
+        );
+    } else if is_paused {
+        right_controls = right_controls
+            .child(
+                div()
+                    .id("pill-resume-btn")
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded_full()
+                    .bg(ca(0x4ade8024))
+                    .border_1()
+                    .border_color(ca(0x4ade8055))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.))
+                    .cursor_pointer()
+                    .hover(|s| s.bg(ca(0x4ade8038)))
+                    .child(icon("play", 12., emerald))
+                    .child(
+                        div()
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(c(0xdcfce7))
+                            .child("Resume"),
+                    )
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.defer(toggle_pause_dictation);
+                    }),
+            )
+            .child(
+                div()
+                    .id("pill-done-btn")
+                    .size(px(28.))
+                    .rounded_full()
+                    .bg(ca(0x6366f130))
+                    .border_1()
+                    .border_color(ca(0x818cf866))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.bg(ca(0x6366f14a)))
+                    .child(icon("check", 13.5, c(0xe0e7ff)))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        cx.stop_propagation();
+                        cx.defer(finish_dictation_from_window);
+                    }),
+            );
+    }
+
+    let right_controls = right_controls
         .child(
             div()
                 .id("pill-settings-btn")
@@ -544,7 +701,10 @@ pub fn render_pill(cx: &mut App) -> AnyElement {
                     cx.stop_propagation();
                     let is_active = matches!(
                         cx.global::<VoiceState>().phase,
-                        Phase::Listening { .. } | Phase::Loading { .. } | Phase::Downloading { .. }
+                        Phase::Listening { .. }
+                            | Phase::Paused { .. }
+                            | Phase::Loading { .. }
+                            | Phase::Downloading { .. }
                     );
                     if is_active {
                         cancel_dictation_from_window(window, cx);
@@ -1228,6 +1388,24 @@ fn live_waveform(bars: [f32; WAVEFORM_BARS], indigo: Hsla, violet: Hsla) -> Div 
                 .rounded(px(999.))
                 .bg(if i % 2 == 0 { indigo } else { violet })
                 .opacity(0.45 + v.clamp(0.0, 1.0) * 0.55)
+        }))
+}
+
+fn paused_waveform(amber: Hsla) -> Div {
+    const HEIGHTS: [f32; 10] = [4., 6., 5., 8., 6., 4., 7., 5., 6., 4.];
+    div()
+        .h(px(22.))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(2.5))
+        .children(HEIGHTS.into_iter().map(move |h| {
+            div()
+                .w(px(3.))
+                .h(px(h))
+                .rounded(px(999.))
+                .bg(amber)
+                .opacity(0.45)
         }))
 }
 

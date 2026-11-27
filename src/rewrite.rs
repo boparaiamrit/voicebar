@@ -6,9 +6,272 @@ use crate::personalization::{MAX_TRANSCRIPT_BYTES, RewriteProfile};
 use reqwest::blocking::{Client, Response};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OllamaInstallState {
+    /// Local Ollama HTTP API is reachable on 127.0.0.1:11434.
+    Running,
+    /// `ollama` binary exists on this computer, but the daemon is not running yet.
+    InstalledStopped,
+    /// `ollama` was not found on PATH or standard install folders.
+    NotInstalled,
+}
+
+/// Locate an existing local `ollama` executable without spawning a shell.
+pub fn find_ollama_binary() -> Option<PathBuf> {
+    let exe_name = if cfg!(windows) { "ollama.exe" } else { "ollama" };
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            let candidate = dir.join(exe_name);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        for env_key in ["LOCALAPPDATA", "ProgramFiles", "USERPROFILE"] {
+            if let Ok(base) = std::env::var(env_key) {
+                for rel in [
+                    r"Programs\Ollama\ollama.exe",
+                    r"Ollama\ollama.exe",
+                    r"AppData\Local\Programs\Ollama\ollama.exe",
+                ] {
+                    let p = PathBuf::from(&base).join(rel);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        for p in [
+            "/usr/local/bin/ollama",
+            "/opt/homebrew/bin/ollama",
+            "/Applications/Ollama.app/Contents/Resources/ollama",
+        ] {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        for p in ["/usr/local/bin/ollama", "/usr/bin/ollama"] {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn ollama_is_reachable() -> bool {
+    let Ok(client) = Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_millis(900))
+        .timeout(Duration::from_millis(1500))
+        .build()
+    else {
+        return false;
+    };
+    client
+        .get(format!("{OLLAMA}/api/tags"))
+        .send()
+        .is_ok_and(|r| r.status().is_success())
+}
+
+pub fn check_ollama_state() -> OllamaInstallState {
+    if ollama_is_reachable() {
+        OllamaInstallState::Running
+    } else if find_ollama_binary().is_some() {
+        OllamaInstallState::InstalledStopped
+    } else {
+        OllamaInstallState::NotInstalled
+    }
+}
+
+/// Start an already-installed local Ollama daemon silently in the background and wait up to 8s.
+pub fn start_ollama_daemon() -> Result<(), &'static str> {
+    if ollama_is_reachable() {
+        return Ok(());
+    }
+    let bin = find_ollama_binary()
+        .ok_or("Ollama is not installed on this computer yet. Click Install Ollama first.")?;
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        cmd.creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS);
+    }
+    cmd.spawn()
+        .map_err(|_| "Voicebar could not start Ollama. Try opening the Ollama app directly.")?;
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(300));
+        if ollama_is_reachable() {
+            return Ok(());
+        }
+    }
+    Err("Ollama started, but did not respond within 8 seconds. Click Recheck in a moment.")
+}
+
+pub fn ollama_download_url() -> &'static str {
+    if cfg!(windows) {
+        "https://ollama.com/download/windows"
+    } else if cfg!(target_os = "macos") {
+        "https://ollama.com/download/mac"
+    } else {
+        "https://ollama.com/download/linux"
+    }
+}
+
+/// Open the official Ollama download page in the system browser.
+pub fn open_ollama_download_page() {
+    let url = ollama_download_url();
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = Command::new("open").arg(url).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
+/// Attempt one-click local installation via winget (Windows) or Homebrew (macOS),
+/// then start Ollama automatically. Falls back to opening ollama.com/download cleanly.
+pub fn install_ollama_auto(cancel: &AtomicBool) -> Result<(), &'static str> {
+    if ollama_is_reachable() {
+        return Ok(());
+    }
+    if find_ollama_binary().is_some() {
+        return start_ollama_daemon();
+    }
+    if cancel.load(Ordering::Acquire) {
+        return Err("Cancelled.");
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let mut child = match Command::new("winget")
+            .args([
+                "install",
+                "-e",
+                "--id",
+                "Ollama.Ollama",
+                "--accept-package-agreements",
+                "--accept-source-agreements",
+                "--silent",
+            ])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                open_ollama_download_page();
+                return Err(
+                    "Opened ollama.com/download in your browser. Run the installer, then click Recheck.",
+                );
+            }
+        };
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                let _ = child.kill();
+                return Err("Installation cancelled.");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) => {
+                    open_ollama_download_page();
+                    return Err(
+                        "Automatic winget install could not finish — opened ollama.com/download. Install it, then click Recheck.",
+                    );
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                Err(_) => {
+                    open_ollama_download_page();
+                    return Err("Opened ollama.com/download in your browser. Run the installer, then click Recheck.");
+                }
+            }
+        }
+        return start_ollama_daemon();
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut child = match Command::new("brew")
+            .args(["install", "--cask", "ollama"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => {
+                open_ollama_download_page();
+                return Err(
+                    "Opened ollama.com/download/mac in your browser. Install Ollama, then click Recheck.",
+                );
+            }
+        };
+        loop {
+            if cancel.load(Ordering::Acquire) {
+                let _ = child.kill();
+                return Err("Installation cancelled.");
+            }
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => break,
+                Ok(Some(_)) | Err(_) => {
+                    open_ollama_download_page();
+                    return Err("Opened ollama.com/download/mac. Install Ollama, then click Recheck.");
+                }
+                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+            }
+        }
+        return start_ollama_daemon();
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        open_ollama_download_page();
+        Err("Opened ollama.com/download/linux (or run: curl -fsSL https://ollama.com/install.sh | sh), then click Recheck.")
+    }
+}
 
 const OLLAMA: &str = "http://127.0.0.1:11434";
 const MAX_RESPONSE_BYTES: u64 = 64 * 1024;
@@ -485,6 +748,7 @@ mod tests {
         assert!(EDITING_RULES.contains("maybe"));
         assert!(EDITING_RULES.contains("tentative"));
         assert!(EDITING_RULES.contains("Hinglish"));
+        assert!(ollama_download_url().starts_with("https://ollama.com/download/"));
     }
 
     #[test]

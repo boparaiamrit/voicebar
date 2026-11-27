@@ -1,7 +1,8 @@
 //! Dark-glass Personal Rewrite Studio for optional local dictation rephrasing.
-//! Lets users turn optional rephrasing ON/OFF, pick a fast text-only local Ollama model
-//! (Qwen 3 / Qwen 2.5 / Sarvam AI), inspect or clear their saved profile, import/paste
-//! samples, review up to five examples, compare three fresh dictations, and activate.
+//! Clean 3-zone app shell (Fixed Header + Overflow-Safe Scroll Body + Sticky Footer):
+//! - Detects Ollama state (Running / Installed-but-stopped / Not Installed) with one-click Start & Install.
+//! - Offers ultra-tiny (<1 GB) through balanced & Sarvam AI Indian-language text-only local models.
+//! - Clean 2-column history picker, zero text overflow, responsive first-click controls, and sticky footer CTAs.
 
 use crate::config::RewriteModel;
 use crate::history_import::{self, Source};
@@ -9,6 +10,7 @@ use crate::overlay::icon;
 use crate::personalization::{
     PREVIEW_COUNT, ProfilePreview, RewritePair, SetupDraft, count_paste_entries,
 };
+use crate::rewrite::OllamaInstallState;
 use crate::{VoiceState, hotkey, rewrite};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::prelude::FluentBuilder;
@@ -38,10 +40,10 @@ pub fn open(cx: &mut App) {
         }
         cx.global_mut::<SetupWindow>().0 = None;
     }
-    let bounds = Bounds::centered(None, size(px(920.), px(690.)), cx);
+    let bounds = Bounds::centered(None, size(px(920.), px(700.)), cx);
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
-        window_min_size: Some(size(px(680.), px(520.))),
+        window_min_size: Some(size(px(700.), px(540.))),
         titlebar: Some(TitlebarOptions {
             title: Some("Voicebar · Personal Rewrite Studio".into()),
             ..Default::default()
@@ -84,7 +86,6 @@ enum Page {
 }
 
 impl Page {
-    /// Stepper index (0 = Samples, 1 = Review, 2 = Compare, 3 = Active).
     fn step_index(self) -> Option<usize> {
         match self {
             Page::Start => None,
@@ -101,15 +102,24 @@ enum ModelStatus {
     Checking,
     Ready,
     Missing,
-    Offline(&'static str),
+    OllamaStopped,
+    OllamaNotInstalled,
+    Error(&'static str),
 }
 
 enum Failure {
     MissingModel,
+    OllamaStopped,
+    OllamaNotInstalled,
     Message(&'static str),
 }
 
 fn check_model(model: RewriteModel) -> Result<(), Failure> {
+    match rewrite::check_ollama_state() {
+        OllamaInstallState::NotInstalled => return Err(Failure::OllamaNotInstalled),
+        OllamaInstallState::InstalledStopped => return Err(Failure::OllamaStopped),
+        OllamaInstallState::Running => {}
+    }
     match rewrite::probe_model(model).map_err(Failure::Message)? {
         true => Ok(()),
         false => Err(Failure::MissingModel),
@@ -178,25 +188,52 @@ impl Setup {
     fn probe_active_model(&mut self, cx: &mut Context<Self>) {
         let model = self.active_model(cx);
         self.model_status = ModelStatus::Checking;
-        let task = cx
-            .background_executor()
-            .spawn(async move { rewrite::probe_model(model) });
+        let task = cx.background_executor().spawn(async move {
+            match rewrite::check_ollama_state() {
+                OllamaInstallState::NotInstalled => ModelStatus::OllamaNotInstalled,
+                OllamaInstallState::InstalledStopped => ModelStatus::OllamaStopped,
+                OllamaInstallState::Running => match rewrite::probe_model(model) {
+                    Ok(true) => ModelStatus::Ready,
+                    Ok(false) => ModelStatus::Missing,
+                    Err(msg) => ModelStatus::Error(msg),
+                },
+            }
+        });
         cx.spawn(async move |view, cx| {
-            let result = task.await;
+            let status = task.await;
             let _ = view.update(cx, |view, cx| {
-                // Only apply if user hasn't switched models while probing.
                 if view.active_model(cx) != model {
                     return;
                 }
-                view.model_status = match result {
-                    Ok(true) => ModelStatus::Ready,
-                    Ok(false) => ModelStatus::Missing,
-                    Err(msg) => ModelStatus::Offline(msg),
-                };
+                view.model_status = status;
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    fn start_ollama(&mut self, cx: &mut Context<Self>) {
+        self.run(
+            "Starting local Ollama service…",
+            cx,
+            |_| rewrite::start_ollama_daemon().map_err(Failure::Message),
+            |view, _, cx| {
+                view.problem = None;
+                view.probe_active_model(cx);
+            },
+        );
+    }
+
+    fn install_ollama(&mut self, cx: &mut Context<Self>) {
+        self.run(
+            "Installing Ollama locally (this can take 1–2 minutes)…",
+            cx,
+            |cancel| rewrite::install_ollama_auto(cancel).map_err(Failure::Message),
+            |view, _, cx| {
+                view.problem = None;
+                view.probe_active_model(cx);
+            },
+        );
     }
 
     fn select_model(&mut self, model: RewriteModel, cx: &mut Context<Self>) {
@@ -262,8 +299,15 @@ impl Setup {
                 match result {
                     Ok(value) => apply(view, value, cx),
                     Err(error) => {
-                        if matches!(error, Failure::MissingModel) {
-                            view.model_status = ModelStatus::Missing;
+                        match error {
+                            Failure::MissingModel => view.model_status = ModelStatus::Missing,
+                            Failure::OllamaStopped => {
+                                view.model_status = ModelStatus::OllamaStopped
+                            }
+                            Failure::OllamaNotInstalled => {
+                                view.model_status = ModelStatus::OllamaNotInstalled
+                            }
+                            Failure::Message(_) => {}
                         }
                         view.problem = Some(error);
                     }
@@ -300,7 +344,11 @@ impl Setup {
             return;
         }
         self.run(
-            "Reading your selected histories locally…",
+            format!(
+                "Reading newest messages from {} selected source{}…",
+                selected.len(),
+                if selected.len() == 1 { "" } else { "s" }
+            ),
             cx,
             move |cancel| {
                 history_import::read_selected_cancellable(&selected, cancel)
@@ -448,7 +496,6 @@ impl Setup {
     fn download(&mut self, cx: &mut Context<Self>) {
         let model = self.active_model(cx);
         let progress_slot = self.pull_progress.clone();
-        // Start a gentle periodic UI refresh while downloading so the progress bar animates live.
         let poll_cancel = Arc::new(AtomicBool::new(false));
         let poll_flag = poll_cancel.clone();
         cx.spawn(async move |view, cx| {
@@ -506,8 +553,6 @@ impl Setup {
         let saved_count = preview.inputs.profile.examples().len();
         match crate::activate_rewrite_profile(cx, preview.inputs.profile.clone()) {
             Ok(()) => {
-                // Drop input editors (including undo history), imported entries,
-                // and comparison text immediately once the approved profile is saved.
                 *self = Self::new(window, cx);
                 self.saved_example_count = saved_count;
                 self.model_status = ModelStatus::Ready;
@@ -527,7 +572,7 @@ impl Setup {
 }
 
 // =========================================================================
-// Dark-glass UI building blocks (explicitly colored — never white-on-white!)
+// Dark-glass UI building blocks (strictly contrast-safe & overflow-safe)
 // =========================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -541,7 +586,7 @@ enum BtnTone {
 fn btn(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     tone: BtnTone,
     disabled: bool,
     full_width: bool,
@@ -556,6 +601,7 @@ fn btn(
 
     div()
         .id(id)
+        .flex_none()
         .h(px(34.))
         .px(px(14.))
         .rounded(px(9.))
@@ -587,13 +633,13 @@ fn btn(
                     }),
                 )
         })
-        .child(label)
+        .child(label.into())
 }
 
 fn action(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
 ) -> Stateful<Div> {
     btn(cx, id, label, BtnTone::Secondary, false, false, handle)
@@ -602,7 +648,7 @@ fn action(
 fn action_primary(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
 ) -> Stateful<Div> {
     btn(cx, id, label, BtnTone::Primary, false, false, handle)
@@ -611,7 +657,7 @@ fn action_primary(
 fn action_primary_full(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
 ) -> Stateful<Div> {
     btn(cx, id, label, BtnTone::Primary, false, true, handle)
@@ -620,7 +666,7 @@ fn action_primary_full(
 fn action_secondary_full(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
 ) -> Stateful<Div> {
     btn(cx, id, label, BtnTone::Secondary, false, true, handle)
@@ -629,39 +675,43 @@ fn action_secondary_full(
 fn action_ghost(
     cx: &Context<Setup>,
     id: &'static str,
-    label: &'static str,
+    label: impl Into<SharedString>,
     handle: impl Fn(&mut Setup, &mut Window, &mut Context<Setup>) + 'static,
 ) -> Stateful<Div> {
     btn(cx, id, label, BtnTone::Ghost, false, false, handle)
 }
 
 fn col() -> Div {
-    div().min_w_0().flex().flex_col().gap(px(12.))
+    div().w_full().min_w_0().flex().flex_col().gap(px(12.))
 }
 
 fn row() -> Div {
-    div().flex().flex_row().items_center().gap(px(8.))
+    div().min_w_0().flex().flex_row().items_center().gap(px(8.))
 }
 
 fn actions_bar() -> Div {
     div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_wrap()
         .items_center()
         .gap(px(8.))
-        .pt(px(4.))
 }
 
 fn subtle(message: impl Into<SharedString>) -> Div {
     div()
-        .text_size(px(13.5))
-        .line_height(px(20.))
+        .w_full()
+        .min_w_0()
+        .text_size(px(13.))
+        .line_height(px(19.5))
         .text_color(c(0x9ca3af))
         .child(message.into())
 }
 
 fn badge_pill(label: impl Into<SharedString>, bg: Hsla, fg: Hsla) -> Div {
     div()
+        .flex_none()
         .px(px(8.))
         .py(px(2.))
         .rounded(px(999.))
@@ -672,21 +722,27 @@ fn badge_pill(label: impl Into<SharedString>, bg: Hsla, fg: Hsla) -> Div {
         .child(label.into())
 }
 
-fn glass_card(eyebrow: &'static str, value: &str, accented: bool, icon_name: Option<&'static str>) -> Div {
+fn glass_card(
+    eyebrow: &'static str,
+    value: &str,
+    accented: bool,
+    icon_name: Option<&'static str>,
+) -> Div {
     let indigo = c(0x818cf8);
     let text_hi = c(0xf4f4f6);
     let text_dim = c(0x9ca3af);
     div()
         .flex_1()
         .min_w_0()
-        .p(px(16.))
-        .rounded(px(14.))
+        .w_full()
+        .p(px(14.))
+        .rounded(px(13.))
         .bg(if accented { ca(0x6366f114) } else { c(0x14141f) })
         .border_1()
         .border_color(if accented { ca(0x818cf855) } else { ca(0xffffff16) })
         .flex()
         .flex_col()
-        .gap(px(10.))
+        .gap(px(8.))
         .child(
             row()
                 .when_some(icon_name, |d, ic| {
@@ -702,8 +758,10 @@ fn glass_card(eyebrow: &'static str, value: &str, accented: bool, icon_name: Opt
         )
         .child(
             div()
-                .text_size(px(14.5))
-                .line_height(px(22.))
+                .w_full()
+                .min_w_0()
+                .text_size(px(14.))
+                .line_height(px(21.))
                 .text_color(text_hi)
                 .child(value.to_owned()),
         )
@@ -712,15 +770,17 @@ fn glass_card(eyebrow: &'static str, value: &str, accented: bool, icon_name: Opt
 fn stepper(active: usize) -> Div {
     const STEPS: [&str; 4] = ["Samples", "Review", "Compare", "Active"];
     let mut bar = div()
+        .w_full()
+        .min_w_0()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.))
-        .pb(px(4.));
+        .gap(px(8.));
     for (i, label) in STEPS.iter().enumerate() {
         let done = i < active;
         let current = i == active;
         let circle = div()
+            .flex_none()
             .size(px(22.))
             .rounded_full()
             .bg(if done {
@@ -753,6 +813,7 @@ fn stepper(active: usize) -> Div {
             });
         bar = bar.child(
             row()
+                .flex_none()
                 .gap(px(6.))
                 .child(circle)
                 .child(
@@ -777,6 +838,7 @@ fn stepper(active: usize) -> Div {
             bar = bar.child(
                 div()
                     .flex_1()
+                    .min_w(px(12.))
                     .h(px(1.5))
                     .rounded_full()
                     .bg(if done { ca(0x4ade8055) } else { ca(0xffffff14) }),
@@ -787,7 +849,7 @@ fn stepper(active: usize) -> Div {
 }
 
 // =========================================================================
-// Pages
+// Pages + Sticky Footers
 // =========================================================================
 
 impl Setup {
@@ -814,6 +876,167 @@ impl Setup {
         }
     }
 
+    /// Actionable Ollama setup banner whenever Ollama is missing or stopped.
+    fn ollama_action_banner(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let busy = self.busy.is_some();
+        let amber = c(0xfbbf24);
+        let indigo = c(0x818cf8);
+        match self.model_status {
+            ModelStatus::OllamaStopped => Some(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(ca(0xfbbf2414))
+                    .border_1()
+                    .border_color(ca(0xfbbf2444))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(icon("power", 16., amber))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c(0xf4f4f6))
+                                            .child("Ollama is installed, but not running"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .line_height(px(17.))
+                                            .text_color(c(0xd1d5db))
+                                            .child("Start Ollama locally to download models or run optional rephrasing. Direct GPU dictation still works without it."),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .flex_none()
+                            .child(btn(
+                                cx,
+                                "banner-start-ollama",
+                                "Start Ollama",
+                                BtnTone::Primary,
+                                busy,
+                                false,
+                                |s, _, cx| s.start_ollama(cx),
+                            ))
+                            .child(btn(
+                                cx,
+                                "banner-recheck-stopped",
+                                "Recheck",
+                                BtnTone::Secondary,
+                                busy,
+                                false,
+                                |s, _, cx| s.probe_active_model(cx),
+                            )),
+                    ),
+            ),
+            ModelStatus::OllamaNotInstalled => Some(
+                div()
+                    .w_full()
+                    .min_w_0()
+                    .p(px(12.))
+                    .rounded(px(12.))
+                    .bg(ca(0x6366f114))
+                    .border_1()
+                    .border_color(ca(0x818cf848))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(10.))
+                            .child(icon("download", 16., indigo))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(2.))
+                                    .child(
+                                        div()
+                                            .text_size(px(13.))
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .text_color(c(0xf4f4f6))
+                                            .child("Ollama not detected on this computer"),
+                                    )
+                                    .child(
+                                        div()
+                                            .w_full()
+                                            .min_w_0()
+                                            .text_size(px(12.))
+                                            .line_height(px(17.))
+                                            .text_color(c(0xd1d5db))
+                                            .child("Install free local Ollama to run tiny 520 MB–4B rephrasing models privately offline. Direct GPU dictation needs nothing extra."),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        row()
+                            .flex_none()
+                            .child(btn(
+                                cx,
+                                "banner-install-ollama",
+                                "Install Ollama",
+                                BtnTone::Primary,
+                                busy,
+                                false,
+                                |s, _, cx| s.install_ollama(cx),
+                            ))
+                            .child(btn(
+                                cx,
+                                "banner-download-ollama",
+                                "Website",
+                                BtnTone::Secondary,
+                                false,
+                                false,
+                                |_, _, _| rewrite::open_ollama_download_page(),
+                            ))
+                            .child(btn(
+                                cx,
+                                "banner-recheck-missing",
+                                "Recheck",
+                                BtnTone::Ghost,
+                                busy,
+                                false,
+                                |s, _, cx| s.probe_active_model(cx),
+                            )),
+                    ),
+            ),
+            _ => None,
+        }
+    }
+
     fn start_page(&self, cx: &mut Context<Self>) -> Div {
         let cfg = cx.global::<VoiceState>().config.clone();
         let active_model = cfg.rewrite_model;
@@ -824,21 +1047,24 @@ impl Setup {
         let violet = c(0xa78bfa);
         let emerald = c(0x4ade80);
         let amber = c(0xfbbf24);
+        let cyan = c(0x38bdf8);
         let text_hi = c(0xf4f4f6);
         let text_mid = c(0xa1a1aa);
         let text_dim = c(0x71717a);
 
-        let mut body = col().gap(px(16.)).child(subtle(
-            "Optional local rephrasing cleans spoken fillers, self-corrections, and phrasing using a fast text-only Ollama model. Turn it OFF anytime to paste raw GPU speech-to-text directly.",
+        let mut body = col().gap(px(14.)).child(subtle(
+            "Optional local rephrasing cleans spoken fillers, self-corrections, and phrasing using a fast text-only Ollama model. Switch Rephrasing OFF anytime to paste raw GPU speech-to-text directly.",
         ));
 
-        // 1. Existing active profile card (view examples + clear/reset + toggle)
+        // 1. Existing active profile card
         if let Some(profile) = cfg.rewrite_profile.as_ref().filter(|p| p.is_valid()) {
             let count = profile.examples().len();
-            let mut pairs_preview = div().flex().flex_col().gap(px(6.));
+            let mut pairs_preview = div().w_full().min_w_0().flex().flex_col().gap(px(6.));
             for ex in profile.examples().iter().take(3) {
                 pairs_preview = pairs_preview.child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .px(px(10.))
                         .py(px(7.))
                         .rounded(px(8.))
@@ -887,8 +1113,10 @@ impl Setup {
             };
             body = body.child(
                 div()
-                    .p(px(16.))
-                    .rounded(px(14.))
+                    .w_full()
+                    .min_w_0()
+                    .p(px(14.))
+                    .rounded(px(13.))
                     .bg(ca(0x4ade800e))
                     .border_1()
                     .border_color(ca(0x4ade803a))
@@ -897,6 +1125,8 @@ impl Setup {
                     .gap(px(10.))
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
                             .flex()
                             .flex_row()
                             .items_center()
@@ -963,18 +1193,151 @@ impl Setup {
             );
         }
 
-        // 2. Local Text-Only Ollama Model Selector (including Sarvam AI models for Indian languages)
-        let mut model_cards = div().flex().flex_col().gap(px(6.));
+        // 2. Entry cards RIGHT ABOVE models OR clean compact model selector + entry cards
+        let entry_heading = if has_profile {
+            "REBUILD PROFILE FROM NEW SAMPLES"
+        } else {
+            "BUILD YOUR PERSONAL PROFILE"
+        };
+
+        body = body.child(
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(8.))
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(text_dim)
+                        .child(entry_heading),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .gap(px(12.))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .p(px(14.))
+                                .rounded(px(13.))
+                                .bg(c(0x14141f))
+                                .border_1()
+                                .border_color(ca(0xffffff16))
+                                .flex()
+                                .flex_col()
+                                .justify_between()
+                                .gap(px(10.))
+                                .child(
+                                    col()
+                                        .gap(px(5.))
+                                        .child(
+                                            row()
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .size(px(28.))
+                                                        .rounded(px(8.))
+                                                        .bg(ca(0x6366f124))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .child(icon("file-text", 14., indigo)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(14.))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(text_hi)
+                                                        .child("Paste transcripts"),
+                                                ),
+                                        )
+                                        .child(subtle(
+                                            "Paste 1–50 rough dictations or messages you picked yourself.",
+                                        )),
+                                )
+                                .child(action_primary_full(
+                                    cx,
+                                    "start-paste",
+                                    "Paste samples",
+                                    |s, _, cx| s.show(Page::Paste, cx),
+                                )),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .p(px(14.))
+                                .rounded(px(13.))
+                                .bg(c(0x14141f))
+                                .border_1()
+                                .border_color(ca(0xffffff16))
+                                .flex()
+                                .flex_col()
+                                .justify_between()
+                                .gap(px(10.))
+                                .child(
+                                    col()
+                                        .gap(px(5.))
+                                        .child(
+                                            row()
+                                                .child(
+                                                    div()
+                                                        .flex_none()
+                                                        .size(px(28.))
+                                                        .rounded(px(8.))
+                                                        .bg(ca(0xa78bfa22))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .child(icon("terminal", 14., violet)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_size(px(14.))
+                                                        .font_weight(FontWeight::SEMIBOLD)
+                                                        .text_color(text_hi)
+                                                        .child("Import local histories"),
+                                                ),
+                                        )
+                                        .child(subtle(
+                                            "Read-only scan of selected local assistants. Assistant replies excluded.",
+                                        )),
+                                )
+                                .child(action_secondary_full(
+                                    cx,
+                                    "start-history",
+                                    "Choose histories",
+                                    |s, _, cx| s.find_sources(cx),
+                                )),
+                        ),
+                ),
+        );
+
+        // 3. Local Text-Only Ollama Model Selector (from ultra-tiny 520 MB up to Sarvam AI)
+        let mut model_cards = div().w_full().min_w_0().flex().flex_col().gap(px(6.));
         for (i, model) in RewriteModel::ALL.into_iter().enumerate() {
             let selected = model == active_model;
             let show_install = selected && matches!(self.model_status, ModelStatus::Missing) && !busy;
             let status_chip = if selected {
                 match self.model_status {
                     ModelStatus::Ready => Some(badge_pill("Installed", ca(0x4ade8022), emerald)),
-                    ModelStatus::Missing => Some(badge_pill("Not installed", ca(0xfbbf2422), amber)),
+                    ModelStatus::Missing => Some(badge_pill("Not downloaded", ca(0xfbbf2422), amber)),
                     ModelStatus::Checking => Some(badge_pill("Checking…", ca(0xffffff10), text_mid)),
-                    ModelStatus::Offline(_) => {
-                        Some(badge_pill("Ollama offline", ca(0xf8717122), c(0xf87171)))
+                    ModelStatus::OllamaStopped => {
+                        Some(badge_pill("Ollama stopped", ca(0xfbbf2422), amber))
+                    }
+                    ModelStatus::OllamaNotInstalled => {
+                        Some(badge_pill("Install Ollama", ca(0xf8717122), c(0xf87171)))
+                    }
+                    ModelStatus::Error(_) => {
+                        Some(badge_pill("Unavailable", ca(0xf8717122), c(0xf87171)))
                     }
                 }
             } else {
@@ -986,6 +1349,8 @@ impl Setup {
                     .id(ElementId::Name(SharedString::from(format!(
                         "studio-llm-{i}"
                     ))))
+                    .w_full()
+                    .min_w_0()
                     .px(px(12.))
                     .py(px(9.))
                     .rounded(px(11.))
@@ -1008,6 +1373,7 @@ impl Setup {
                     .gap(px(10.))
                     .child(
                         div()
+                            .flex_none()
                             .size(px(8.))
                             .rounded_full()
                             .bg(if selected { indigo } else { ca(0xffffff24) }),
@@ -1029,8 +1395,11 @@ impl Setup {
                                             .text_color(text_hi)
                                             .child(model.display_name()),
                                     )
+                                    .when(model.is_small_fast(), |d| {
+                                        d.child(badge_pill("Tiny · Fast", ca(0x38bdf822), cyan))
+                                    })
                                     .when(model == RewriteModel::Qwen3_4b, |d| {
-                                        d.child(badge_pill("Default", ca(0x6366f128), indigo))
+                                        d.child(badge_pill("Balanced", ca(0x6366f128), indigo))
                                     })
                                     .when(model.is_indic_focused(), |d| {
                                         d.child(badge_pill("India / Indic", ca(0xa78bfa24), violet))
@@ -1038,6 +1407,8 @@ impl Setup {
                             )
                             .child(
                                 div()
+                                    .w_full()
+                                    .min_w_0()
                                     .text_size(px(11.5))
                                     .text_color(text_mid)
                                     .truncate()
@@ -1045,11 +1416,7 @@ impl Setup {
                             ),
                     )
                     .when_some(status_chip, |d, chip| d.child(chip))
-                    .child(badge_pill(
-                        model.size_label(),
-                        ca(0xffffff0c),
-                        text_mid,
-                    ))
+                    .child(badge_pill(model.size_label(), ca(0xffffff0c), text_mid))
                     .when(show_install, |d| {
                         d.child(action_primary(
                             cx,
@@ -1058,19 +1425,27 @@ impl Setup {
                             |s, _, cx| s.download(cx),
                         ))
                     })
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.select_model(model, cx);
-                    })),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.select_model(model, cx);
+                        }),
+                    ),
             );
         }
 
-        body = body.child(
+        body.child(
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(8.))
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
                         .flex_row()
                         .items_center()
@@ -1080,137 +1455,16 @@ impl Setup {
                                 .text_size(px(11.))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(text_dim)
-                                .child("LOCAL REWRITE MODEL · PURE TEXT-ONLY (NO VISION OVERHEAD)"),
+                                .child("LOCAL REWRITE MODELS · PURE TEXT-ONLY (520 MB TO 24B)"),
                         )
                         .child(
                             div()
                                 .text_size(px(11.))
                                 .text_color(text_dim)
-                                .child("Runs locally via Ollama"),
+                                .child("Runs 100% locally via Ollama"),
                         ),
                 )
                 .child(model_cards),
-        );
-
-        // 3. Two clear entry cards to build or rebuild a profile
-        let entry_heading = if has_profile {
-            "REBUILD PROFILE FROM NEW SAMPLES"
-        } else {
-            "BUILD YOUR PERSONAL PROFILE"
-        };
-
-        body.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(8.))
-                .child(
-                    div()
-                        .text_size(px(11.))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(text_dim)
-                        .child(entry_heading),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .flex_row()
-                        .gap(px(12.))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .p(px(16.))
-                                .rounded(px(14.))
-                                .bg(c(0x14141f))
-                                .border_1()
-                                .border_color(ca(0xffffff16))
-                                .flex()
-                                .flex_col()
-                                .justify_between()
-                                .gap(px(12.))
-                                .child(
-                                    col()
-                                        .gap(px(6.))
-                                        .child(
-                                            row()
-                                                .child(
-                                                    div()
-                                                        .size(px(30.))
-                                                        .rounded(px(9.))
-                                                        .bg(ca(0x6366f124))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(icon("file-text", 15., indigo)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(14.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(text_hi)
-                                                        .child("Paste transcripts"),
-                                                ),
-                                        )
-                                        .child(subtle(
-                                            "Paste 1–50 real dictations or rough messages you chose yourself.",
-                                        )),
-                                )
-                                .child(action_primary_full(
-                                    cx,
-                                    "start-paste",
-                                    "Paste samples",
-                                    |s, _, cx| s.show(Page::Paste, cx),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .p(px(16.))
-                                .rounded(px(14.))
-                                .bg(c(0x14141f))
-                                .border_1()
-                                .border_color(ca(0xffffff16))
-                                .flex()
-                                .flex_col()
-                                .justify_between()
-                                .gap(px(12.))
-                                .child(
-                                    col()
-                                        .gap(px(6.))
-                                        .child(
-                                            row()
-                                                .child(
-                                                    div()
-                                                        .size(px(30.))
-                                                        .rounded(px(9.))
-                                                        .bg(ca(0xa78bfa22))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .child(icon("terminal", 15., violet)),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_size(px(14.5))
-                                                        .font_weight(FontWeight::SEMIBOLD)
-                                                        .text_color(text_hi)
-                                                        .child("Import local histories"),
-                                                ),
-                                        )
-                                        .child(subtle(
-                                            "Select local coding assistants to scan read-only. Assistant replies are excluded.",
-                                        )),
-                                )
-                                .child(action_secondary_full(
-                                    cx,
-                                    "start-history",
-                                    "Choose histories",
-                                    |s, _, cx| s.find_sources(cx),
-                                )),
-                        ),
-                ),
         )
     }
 
@@ -1219,7 +1473,10 @@ impl Setup {
         let count_pill = match count_paste_entries(&raw) {
             Ok(0) => badge_pill("0 transcripts", ca(0xffffff10), c(0x9ca3af)),
             Ok(n) => badge_pill(
-                format!("{n} distinct transcript{} ready", if n == 1 { "" } else { "s" }),
+                format!(
+                    "{n} distinct transcript{} ready",
+                    if n == 1 { "" } else { "s" }
+                ),
                 ca(0x4ade8022),
                 c(0x4ade80),
             ),
@@ -1227,21 +1484,31 @@ impl Setup {
         };
 
         col()
-            .gap(px(14.))
+            .gap(px(12.))
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
                     .gap(px(10.))
-                    .child(subtle(
-                        "Separate each transcript with a blank line. Keep hesitations, Hinglish, and self-corrections intact.",
-                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(13.))
+                            .line_height(px(19.))
+                            .text_color(c(0x9ca3af))
+                            .child("Separate each transcript with a blank line. Keep hesitations, Hinglish, and self-corrections intact."),
+                    )
                     .child(count_pill),
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .p(px(2.))
                     .rounded(px(12.))
                     .bg(c(0x14141f))
@@ -1250,20 +1517,8 @@ impl Setup {
                     .child(
                         Textarea::new(&self.paste)
                             .aria_label("Original transcripts")
-                            .h(px(260.)),
+                            .h(px(280.)),
                     ),
-            )
-            .child(
-                actions_bar()
-                    .child(action(cx, "paste-back", "Back", |s, _, cx| {
-                        s.show(Page::Start, cx)
-                    }))
-                    .child(action_primary(
-                        cx,
-                        "use-paste",
-                        "Continue to review",
-                        |s, _, cx| s.accept_paste(cx),
-                    )),
             )
     }
 
@@ -1277,8 +1532,11 @@ impl Setup {
         let text_hi = c(0xf4f4f6);
         let text_mid = c(0xa1a1aa);
 
-        let mut body = col().gap(px(14.)).child(
+        // Overflow-safe green privacy shield banner (.w_full().min_w_0() on both row & text!)
+        let mut body = col().gap(px(12.)).child(
             div()
+                .w_full()
+                .min_w_0()
                 .px(px(14.))
                 .py(px(10.))
                 .rounded(px(11.))
@@ -1287,14 +1545,15 @@ impl Setup {
                 .border_color(ca(0x4ade8030))
                 .flex()
                 .flex_row()
-                .items_center()
+                .items_start()
                 .gap(px(10.))
-                .child(icon("shield-check", 16., emerald))
+                .child(div().pt(px(2.)).flex_none().child(icon("shield-check", 16., emerald)))
                 .child(
                     div()
                         .flex_1()
+                        .min_w_0()
                         .text_size(px(12.5))
-                        .line_height(px(18.))
+                        .line_height(px(18.5))
                         .text_color(c(0xd1d5db))
                         .child("Only sources you check are opened. Assistant replies, tool outputs, and subagents are skipped, and only approved examples are saved on activation."),
                 ),
@@ -1304,6 +1563,8 @@ impl Setup {
             let all = self.sources.iter().all(|(_, checked)| *checked);
             body = body.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1325,6 +1586,7 @@ impl Setup {
                             .hover(|s| s.bg(ca(0xffffff14)))
                             .child(
                                 div()
+                                    .flex_none()
                                     .size(px(16.))
                                     .rounded(px(4.))
                                     .bg(if all { c(0x6366f1) } else { ca(0xffffff10) })
@@ -1343,14 +1605,18 @@ impl Setup {
                                     .child(if all { "Deselect all" } else { "Select all" }),
                             )
                             .when(!busy, |d| {
-                                d.on_click(cx.listener(move |view, _, _, cx| {
-                                    let target = !all;
-                                    for (_, selected) in &mut view.sources {
-                                        *selected = target;
-                                    }
-                                    view.summary.clear();
-                                    cx.notify();
-                                }))
+                                d.on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |view, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let target = !all;
+                                        for (_, selected) in &mut view.sources {
+                                            *selected = target;
+                                        }
+                                        view.summary.clear();
+                                        cx.notify();
+                                    }),
+                                )
                             }),
                     )
                     .child(badge_pill(
@@ -1364,90 +1630,119 @@ impl Setup {
                     )),
             );
 
-            let mut list = div().flex().flex_col().gap(px(6.));
-            for (index, (source, checked)) in self.sources.iter().enumerate() {
-                let checked = *checked;
+            // Clean 2-column grid so 13+ sources fit cleanly with zero cramped scrolling
+            let render_source_card = |index: usize, source: &Source, checked: bool| {
                 let files = source.file_count();
                 let is_voice = source.is_voice();
-                list = list.child(
-                    div()
-                        .id(("history-source-row", index))
-                        .px(px(12.))
-                        .py(px(10.))
-                        .rounded(px(11.))
-                        .bg(if checked {
-                            ca(0x6366f11c)
+                div()
+                    .id(("history-source-row", index))
+                    .flex_1()
+                    .min_w_0()
+                    .px(px(11.))
+                    .py(px(9.))
+                    .rounded(px(10.))
+                    .bg(if checked {
+                        ca(0x6366f11c)
+                    } else {
+                        c(0x14141f)
+                    })
+                    .border_1()
+                    .border_color(if checked {
+                        ca(0x818cf860)
+                    } else {
+                        ca(0xffffff12)
+                    })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(ca(0xffffff10)))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .flex_none()
+                            .size(px(16.))
+                            .rounded(px(4.))
+                            .bg(if checked { c(0x6366f1) } else { ca(0xffffff10) })
+                            .border_1()
+                            .border_color(if checked { indigo } else { ca(0xffffff28) })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(checked, |d| d.child(icon("check", 10.5, c(0xffffff)))),
+                    )
+                    .child(icon(
+                        if is_voice { "mic" } else { "terminal" },
+                        13.5,
+                        if checked { indigo } else { text_mid },
+                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(text_hi)
+                            .truncate()
+                            .child(source.label),
+                    )
+                    .child(badge_pill(
+                        if is_voice { "Voice" } else { "Chat" },
+                        if is_voice {
+                            ca(0xa78bfa24)
                         } else {
-                            c(0x14141f)
-                        })
-                        .border_1()
-                        .border_color(if checked {
-                            ca(0x818cf860)
-                        } else {
-                            ca(0xffffff12)
-                        })
-                        .cursor_pointer()
-                        .hover(|s| s.bg(ca(0xffffff10)))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(10.))
-                        .child(
-                            div()
-                                .size(px(17.))
-                                .rounded(px(5.))
-                                .bg(if checked { c(0x6366f1) } else { ca(0xffffff10) })
-                                .border_1()
-                                .border_color(if checked { indigo } else { ca(0xffffff28) })
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .when(checked, |d| d.child(icon("check", 11., c(0xffffff)))),
-                        )
-                        .child(icon(
-                            if is_voice { "mic" } else { "terminal" },
-                            14.,
-                            if checked { indigo } else { text_mid },
-                        ))
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(13.5))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(text_hi)
-                                .child(source.label),
-                        )
-                        .child(badge_pill(
-                            if is_voice { "Voice" } else { "Chat" },
-                            if is_voice {
-                                ca(0xa78bfa24)
-                            } else {
-                                ca(0xffffff0c)
-                            },
-                            if is_voice { c(0xc4b5fd) } else { text_mid },
-                        ))
-                        .child(badge_pill(
-                            format!("{files} file{}", if files == 1 { "" } else { "s" }),
-                            ca(0xffffff0a),
-                            text_mid,
-                        ))
-                        .when(!busy, |d| {
-                            d.on_click(cx.listener(move |view, _, _, cx| {
+                            ca(0xffffff0c)
+                        },
+                        if is_voice { c(0xc4b5fd) } else { text_mid },
+                    ))
+                    .child(badge_pill(
+                        format!("{files}"),
+                        ca(0xffffff0a),
+                        text_mid,
+                    ))
+                    .when(!busy, |d| {
+                        d.on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, _, _, cx| {
+                                cx.stop_propagation();
                                 if let Some(entry) = view.sources.get_mut(index) {
                                     entry.1 = !entry.1;
                                 }
                                 view.summary.clear();
                                 cx.notify();
-                            }))
-                        }),
-                );
+                            }),
+                        )
+                    })
+            };
+
+            let mut grid = div().w_full().min_w_0().flex().flex_col().gap(px(8.));
+            let mut idx = 0;
+            while idx < self.sources.len() {
+                let (s_left, c_left) = &self.sources[idx];
+                let mut pair_row = div()
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .gap(px(8.))
+                    .child(render_source_card(idx, s_left, *c_left));
+                if idx + 1 < self.sources.len() {
+                    let (s_right, c_right) = &self.sources[idx + 1];
+                    pair_row = pair_row.child(render_source_card(idx + 1, s_right, *c_right));
+                } else {
+                    pair_row = pair_row.child(div().flex_1().min_w_0());
+                }
+                grid = grid.child(pair_row);
+                idx += 2;
             }
-            body = body.child(list);
+            body = body.child(grid);
         } else if !busy {
             body = body.child(
                 div()
-                    .p(px(20.))
-                    .rounded(px(14.))
+                    .w_full()
+                    .min_w_0()
+                    .p(px(18.))
+                    .rounded(px(13.))
                     .bg(c(0x14141f))
                     .border_1()
                     .border_color(ca(0xffffff14))
@@ -1470,42 +1765,30 @@ impl Setup {
             body = body.child(coverage_box(&self.summary));
         }
 
-        body.child(
-            actions_bar()
-                .child(action(cx, "history-back", "Back", |s, _, cx| {
-                    s.show(Page::Start, cx)
-                }))
-                .child(btn(
-                    cx,
-                    "import-selected",
-                    "Import selected",
-                    BtnTone::Primary,
-                    busy || selected_count == 0,
-                    false,
-                    |s, _, cx| s.import(cx),
-                )),
-        )
+        body
     }
 
-    fn summary_page(&self, cx: &mut Context<Self>) -> Div {
+    fn summary_page(&self, _cx: &mut Context<Self>) -> Div {
         let Some(draft) = self.draft.as_ref() else {
-            return col().child(subtle("No samples loaded yet.")).child(
-                action(cx, "summary-restart", "Start over", |s, _, cx| {
-                    s.show(Page::Start, cx)
-                }),
-            );
+            return col().child(subtle("No samples loaded yet."));
         };
         let total = draft.sample_count();
         let (_, review_count) = draft.review_position();
-        let mut body = col().gap(px(14.)).child(
+        let mut body = col().gap(px(12.)).child(
             row()
                 .child(badge_pill(
-                    format!("{total} distinct transcript{}", if total == 1 { "" } else { "s" }),
+                    format!(
+                        "{total} distinct transcript{}",
+                        if total == 1 { "" } else { "s" }
+                    ),
                     ca(0x4ade8022),
                     c(0x4ade80),
                 ))
                 .child(badge_pill(
-                    format!("Reviewing {review_count} sample{}", if review_count == 1 { "" } else { "s" }),
+                    format!(
+                        "Reviewing {review_count} sample{}",
+                        if review_count == 1 { "" } else { "s" }
+                    ),
                     ca(0x6366f128),
                     c(0x818cf8),
                 )),
@@ -1516,27 +1799,12 @@ impl Setup {
         if let Some(original) = draft.current() {
             body = body.child(glass_card("FIRST SAMPLE PREVIEW", original, false, Some("mic")));
         }
-        body.child(
-            actions_bar()
-                .child(action(cx, "summary-back", "Back", |s, _, cx| {
-                    s.show(s.source_page, cx)
-                }))
-                .child(action_primary(
-                    cx,
-                    "begin-review",
-                    "Start reviewing",
-                    |s, _, cx| s.begin_review(cx),
-                )),
-        )
+        body
     }
 
     fn review_page(&self, cx: &mut Context<Self>) -> Div {
         let Some(draft) = self.draft.as_ref() else {
-            return col().child(subtle("No active draft.")).child(
-                action(cx, "review-home", "Back to start", |s, _, cx| {
-                    s.show(Page::Start, cx)
-                }),
-            );
+            return col().child(subtle("No active draft."));
         };
         let original = draft.current().unwrap_or_default();
         let approved = draft.approved_count();
@@ -1545,9 +1813,11 @@ impl Setup {
         let model = self.active_model(cx);
 
         let mut body = col()
-            .gap(px(14.))
+            .gap(px(12.))
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1577,6 +1847,8 @@ impl Setup {
         if let Some((light, natural)) = &self.suggestions {
             body = body.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .gap(px(12.))
@@ -1617,11 +1889,16 @@ impl Setup {
         } else if self.busy.is_some() {
             body = body.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .gap(px(12.))
                     .child(loading_skeleton("LIGHT CLEANUP", "Generating with Ollama…"))
-                    .child(loading_skeleton("NATURAL REPHRASE", "Preserving certainty & tone…")),
+                    .child(loading_skeleton(
+                        "NATURAL REPHRASE",
+                        "Preserving certainty & tone…",
+                    )),
             );
         } else {
             body = body.child(
@@ -1637,8 +1914,10 @@ impl Setup {
         if self.editing {
             body = body.child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .p(px(14.))
-                    .rounded(px(14.))
+                    .rounded(px(13.))
                     .bg(c(0x14141f))
                     .border_1()
                     .border_color(ca(0x818cf855))
@@ -1659,7 +1938,7 @@ impl Setup {
                     .child(
                         Textarea::new(&self.own)
                             .aria_label("Your preferred wording")
-                            .h(px(116.)),
+                            .h(px(110.)),
                     )
                     .child(
                         actions_bar()
@@ -1680,32 +1959,7 @@ impl Setup {
             );
         }
 
-        let mut choices =
-            actions_bar().child(action(cx, "keep-original", "Keep original", |s, _, cx| {
-                let text = s
-                    .draft
-                    .as_ref()
-                    .and_then(SetupDraft::current)
-                    .map(str::to_owned);
-                s.choose(text, cx);
-            }));
-        if !self.editing {
-            choices = choices.child(action(cx, "edit-own", "Write my own", |s, window, cx| {
-                s.edit_own(window, cx)
-            }));
-        }
-        body.child(
-            choices
-                .child(action_ghost(cx, "skip-sample", "Skip", |s, _, cx| {
-                    s.choose(None, cx)
-                }))
-                .child(action_ghost(
-                    cx,
-                    "change-input",
-                    "Change samples",
-                    |s, _, cx| s.show(s.source_page, cx),
-                )),
-        )
+        body
     }
 
     fn fresh_page(&self, cx: &mut Context<Self>) -> Div {
@@ -1726,21 +1980,31 @@ impl Setup {
         };
 
         col()
-            .gap(px(14.))
+            .gap(px(12.))
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_between()
                     .gap(px(10.))
-                    .child(subtle(
-                        "Paste three brand-new dictations separated by a blank line so you can compare Standard vs. Your Personal Profile side-by-side.",
-                    ))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_size(px(13.))
+                            .line_height(px(19.))
+                            .text_color(c(0x9ca3af))
+                            .child("Paste three brand-new dictations separated by a blank line to compare Standard vs. Your Personal Profile side-by-side."),
+                    )
                     .child(counter),
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .px(px(12.))
                     .py(px(9.))
                     .rounded(px(10.))
@@ -1749,18 +2013,23 @@ impl Setup {
                     .border_color(ca(0x818cf830))
                     .flex()
                     .flex_row()
-                    .items_center()
+                    .items_start()
                     .gap(px(8.))
-                    .child(icon("mic", 14., c(0x818cf8)))
+                    .child(div().pt(px(2.)).flex_none().child(icon("mic", 14., c(0x818cf8))))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .text_size(px(12.))
+                            .line_height(px(17.5))
                             .text_color(c(0xc7d2fe))
                             .child("Tip: Speak with F1, then use Copy Last Transcript in Voicebar's tray menu to paste the raw speech recognition."),
                     ),
             )
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .p(px(2.))
                     .rounded(px(12.))
                     .bg(c(0x14141f))
@@ -1773,91 +2042,60 @@ impl Setup {
                             .readonly(busy),
                     ),
             )
-            .child(
-                actions_bar()
-                    .child(action(cx, "redo-examples", "Edit sample choices", |s, _, cx| {
-                        s.restart_review(cx)
-                    }))
-                    .child(btn(
-                        cx,
-                        "generate-preview",
-                        "Compare rewrites",
-                        BtnTone::Primary,
-                        busy,
-                        false,
-                        |s, _, cx| s.compare(cx),
-                    )),
-            )
     }
 
     fn compare_page(&self, cx: &mut Context<Self>) -> Div {
         let Some(preview) = self.preview.as_ref() else {
-            return col().child(subtle("No comparison generated yet.")).child(
-                action(cx, "compare-back-fresh", "Back", |s, _, cx| {
-                    s.show(Page::Fresh, cx)
-                }),
-            );
+            return col().child(subtle("No comparison generated yet."));
         };
-        let index = self.comparison_index.min(preview.rewrites.len().saturating_sub(1));
+        let index = self
+            .comparison_index
+            .min(preview.rewrites.len().saturating_sub(1));
         let pair = &preview.rewrites[index];
         let model_name = self.active_model(cx).short_label();
 
-        let tabs = row().gap(px(6.)).children((0..preview.rewrites.len()).map(|i| {
-            let active = i == index;
-            div()
-                .id(("cmp-tab", i))
-                .px(px(11.))
-                .py(px(5.))
-                .rounded(px(8.))
-                .bg(if active { ca(0x6366f12e) } else { c(0x14141f) })
-                .border_1()
-                .border_color(if active { ca(0x818cf870) } else { ca(0xffffff14) })
-                .text_size(px(12.))
-                .font_weight(if active {
-                    FontWeight::SEMIBOLD
-                } else {
-                    FontWeight::MEDIUM
-                })
-                .text_color(if active { c(0xf4f4f6) } else { c(0x9ca3af) })
-                .cursor_pointer()
-                .hover(|s| s.bg(ca(0xffffff14)))
-                .child(format!("Test {}", i + 1))
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.comparison_index = i;
-                    cx.notify();
-                }))
-        }));
-
-        let mut navigation = actions_bar();
-        if index > 0 {
-            navigation = navigation.child(action(cx, "previous-pair", "Previous", |s, _, cx| {
-                s.comparison_index = s.comparison_index.saturating_sub(1);
-                cx.notify();
+        let tabs = row()
+            .gap(px(6.))
+            .children((0..preview.rewrites.len()).map(|i| {
+                let active = i == index;
+                div()
+                    .id(("cmp-tab", i))
+                    .px(px(11.))
+                    .py(px(5.))
+                    .rounded(px(8.))
+                    .bg(if active { ca(0x6366f12e) } else { c(0x14141f) })
+                    .border_1()
+                    .border_color(if active {
+                        ca(0x818cf870)
+                    } else {
+                        ca(0xffffff14)
+                    })
+                    .text_size(px(12.))
+                    .font_weight(if active {
+                        FontWeight::SEMIBOLD
+                    } else {
+                        FontWeight::MEDIUM
+                    })
+                    .text_color(if active { c(0xf4f4f6) } else { c(0x9ca3af) })
+                    .cursor_pointer()
+                    .hover(|s| s.bg(ca(0xffffff14)))
+                    .child(format!("Test {}", i + 1))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, _, _, cx| {
+                            cx.stop_propagation();
+                            view.comparison_index = i;
+                            cx.notify();
+                        }),
+                    )
             }));
-        }
-        navigation = if index + 1 == preview.rewrites.len() {
-            navigation.child(action_primary(
-                cx,
-                "activate-profile",
-                "Activate personal profile",
-                |s, window, cx| s.activate(window, cx),
-            ))
-        } else {
-            navigation.child(action_primary(
-                cx,
-                "next-pair",
-                "Next comparison",
-                |s, _, cx| {
-                    s.comparison_index = (s.comparison_index + 1).min(PREVIEW_COUNT - 1);
-                    cx.notify();
-                },
-            ))
-        };
 
         col()
-            .gap(px(14.))
+            .gap(px(12.))
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1877,6 +2115,8 @@ impl Setup {
             ))
             .child(
                 div()
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .flex_row()
                     .gap(px(12.))
@@ -1893,29 +2133,6 @@ impl Setup {
                         Some("sparkles"),
                     )),
             )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .child(navigation)
-                    .child(
-                        actions_bar()
-                            .child(action_ghost(
-                                cx,
-                                "edit-choices",
-                                "Edit sample choices",
-                                |s, _, cx| s.restart_review(cx),
-                            ))
-                            .child(action_ghost(
-                                cx,
-                                "edit-fresh",
-                                "Change test dictations",
-                                |s, _, cx| s.show(Page::Fresh, cx),
-                            )),
-                    ),
-            )
     }
 
     fn done_page(&self, cx: &mut Context<Self>) -> Div {
@@ -1929,8 +2146,10 @@ impl Setup {
                 .unwrap_or(0),
         );
         div()
-            .p(px(28.))
-            .rounded(px(16.))
+            .w_full()
+            .min_w_0()
+            .p(px(26.))
+            .rounded(px(15.))
             .bg(c(0x14141f))
             .border_1()
             .border_color(ca(0x4ade8044))
@@ -1940,7 +2159,7 @@ impl Setup {
             .gap(px(14.))
             .child(
                 div()
-                    .size(px(52.))
+                    .size(px(50.))
                     .rounded_full()
                     .bg(ca(0x4ade8022))
                     .border_1()
@@ -1973,26 +2192,188 @@ impl Setup {
             )
             .child(
                 div()
-                    .max_w(px(540.))
-                    .text_size(px(13.5))
-                    .line_height(px(21.))
+                    .w_full()
+                    .max_w(px(560.))
+                    .text_size(px(13.))
+                    .line_height(px(20.))
                     .text_color(c(0x9ca3af))
-                    .child("Press F1 anywhere to dictate. Voicebar applies your style locally and copies the result to your clipboard. You can switch Optional Rephrasing OFF anytime from Settings or the tray, and Copy Last Transcript always recovers the raw speech."),
+                    .child("Press F1 anywhere to dictate. Voicebar applies your style locally and copies the result to your clipboard. Switch Optional Rephrasing OFF anytime from Settings or the tray."),
             )
-            .child(actions_bar().child(action_primary(
-                cx,
-                "close-complete",
-                "Done",
-                |_, window, cx| {
-                    cx.global_mut::<SetupWindow>().0 = None;
-                    window.remove_window();
-                },
-            )))
+    }
+
+    /// Sticky bottom action footer — ALWAYS pinned and visible on every multi-step page!
+    fn footer_bar(&self, cx: &mut Context<Self>) -> Option<Div> {
+        let busy = self.busy.is_some();
+        let base = || {
+            div()
+                .flex_none()
+                .w_full()
+                .px(px(24.))
+                .py(px(12.))
+                .bg(c(0x101018))
+                .border_t_1()
+                .border_color(ca(0xffffff16))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(12.))
+        };
+
+        match self.page {
+            Page::Start => None,
+            Page::Paste => Some(
+                base()
+                    .child(action(cx, "paste-back", "Back", |s, _, cx| {
+                        s.show(Page::Start, cx)
+                    }))
+                    .child(action_primary(
+                        cx,
+                        "use-paste",
+                        "Continue to review",
+                        |s, _, cx| s.accept_paste(cx),
+                    )),
+            ),
+            Page::Sources => {
+                let selected_count = self.sources.iter().filter(|(_, on)| *on).count();
+                let import_label = if selected_count > 0 {
+                    format!("Import selected ({selected_count})")
+                } else {
+                    "Import selected".to_string()
+                };
+                Some(
+                    base()
+                        .child(action(cx, "history-back", "Back", |s, _, cx| {
+                            s.show(Page::Start, cx)
+                        }))
+                        .child(btn(
+                            cx,
+                            "import-selected",
+                            import_label,
+                            BtnTone::Primary,
+                            busy || selected_count == 0,
+                            false,
+                            |s, _, cx| s.import(cx),
+                        )),
+                )
+            }
+            Page::Summary => Some(
+                base()
+                    .child(action(cx, "summary-back", "Back", |s, _, cx| {
+                        s.show(s.source_page, cx)
+                    }))
+                    .child(action_primary(
+                        cx,
+                        "begin-review",
+                        "Start reviewing",
+                        |s, _, cx| s.begin_review(cx),
+                    )),
+            ),
+            Page::Review => {
+                let mut left = row()
+                    .child(action(cx, "keep-original", "Keep original", |s, _, cx| {
+                        let text = s
+                            .draft
+                            .as_ref()
+                            .and_then(SetupDraft::current)
+                            .map(str::to_owned);
+                        s.choose(text, cx);
+                    }));
+                if !self.editing {
+                    left = left.child(action(cx, "edit-own", "Write my own", |s, window, cx| {
+                        s.edit_own(window, cx)
+                    }));
+                }
+                let right = row()
+                    .child(action_ghost(cx, "skip-sample", "Skip", |s, _, cx| {
+                        s.choose(None, cx)
+                    }))
+                    .child(action_ghost(
+                        cx,
+                        "change-input",
+                        "Change samples",
+                        |s, _, cx| s.show(s.source_page, cx),
+                    ));
+                Some(base().child(left).child(right))
+            }
+            Page::Fresh => Some(
+                base()
+                    .child(action(
+                        cx,
+                        "redo-examples",
+                        "Edit sample choices",
+                        |s, _, cx| s.restart_review(cx),
+                    ))
+                    .child(btn(
+                        cx,
+                        "generate-preview",
+                        "Compare rewrites",
+                        BtnTone::Primary,
+                        busy,
+                        false,
+                        |s, _, cx| s.compare(cx),
+                    )),
+            ),
+            Page::Compare => {
+                let total = self
+                    .preview
+                    .as_ref()
+                    .map(|p| p.rewrites.len())
+                    .unwrap_or(PREVIEW_COUNT);
+                let index = self.comparison_index.min(total.saturating_sub(1));
+                let mut left = row()
+                    .child(action_ghost(
+                        cx,
+                        "edit-choices",
+                        "Edit sample choices",
+                        |s, _, cx| s.restart_review(cx),
+                    ))
+                    .child(action_ghost(
+                        cx,
+                        "edit-fresh",
+                        "Change test dictations",
+                        |s, _, cx| s.show(Page::Fresh, cx),
+                    ));
+                if index > 0 {
+                    left = left.child(action(cx, "previous-pair", "Previous", |s, _, cx| {
+                        s.comparison_index = s.comparison_index.saturating_sub(1);
+                        cx.notify();
+                    }));
+                }
+                let primary_cta = if index + 1 >= total {
+                    action_primary(
+                        cx,
+                        "activate-profile",
+                        "Activate personal profile",
+                        |s, window, cx| s.activate(window, cx),
+                    )
+                } else {
+                    action_primary(cx, "next-pair", "Next comparison", |s, _, cx| {
+                        s.comparison_index = (s.comparison_index + 1).min(PREVIEW_COUNT - 1);
+                        cx.notify();
+                    })
+                };
+                Some(base().child(left).child(primary_cta))
+            }
+            Page::Done => Some(
+                base().justify_end().child(action_primary(
+                    cx,
+                    "close-complete",
+                    "Done",
+                    |_, window, cx| {
+                        cx.global_mut::<SetupWindow>().0 = None;
+                        window.remove_window();
+                    },
+                )),
+            ),
+        }
     }
 }
 
 fn coverage_box(summary: &str) -> Div {
     let mut box_el = div()
+        .w_full()
+        .min_w_0()
         .p(px(12.))
         .rounded(px(11.))
         .bg(c(0x14141f))
@@ -2010,12 +2391,20 @@ fn coverage_box(summary: &str) -> Div {
         );
     for line in summary.lines().filter(|l| !l.trim().is_empty()) {
         box_el = box_el.child(
-            row()
-                .gap(px(6.))
-                .child(div().size(px(5.)).rounded_full().bg(c(0x818cf8)))
+            div()
+                .w_full()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_start()
+                .gap(px(7.))
+                .child(div().mt(px(6.)).flex_none().size(px(5.)).rounded_full().bg(c(0x818cf8)))
                 .child(
                     div()
+                        .flex_1()
+                        .min_w_0()
                         .text_size(px(12.))
+                        .line_height(px(17.))
                         .text_color(c(0xd1d5db))
                         .child(line.to_owned()),
                 ),
@@ -2029,7 +2418,7 @@ fn loading_skeleton(title: &'static str, hint: &'static str) -> Div {
         .flex_1()
         .min_w_0()
         .p(px(16.))
-        .rounded(px(14.))
+        .rounded(px(13.))
         .bg(c(0x14141f))
         .border_1()
         .border_color(ca(0x818cf830))
@@ -2044,7 +2433,7 @@ fn loading_skeleton(title: &'static str, hint: &'static str) -> Div {
                 .child(title),
         )
         .child(div().h(px(12.)).w_full().rounded(px(6.)).bg(ca(0xffffff10)))
-        .child(div().h(px(12.)).w(px(220.)).rounded(px(6.)).bg(ca(0xffffff0a)))
+        .child(div().h(px(12.)).w(px(180.)).rounded(px(6.)).bg(ca(0xffffff0a)))
         .child(div().text_size(px(11.5)).text_color(c(0x71717a)).child(hint))
 }
 
@@ -2064,12 +2453,14 @@ impl Render for Setup {
             Page::Done => self.done_page(cx),
         };
 
-        let mut contents = col()
+        let mut contents = div()
             .w_full()
-            .max_w(px(860.))
-            .px(px(28.))
-            .py(px(22.))
-            .gap(px(16.));
+            .min_w_0()
+            .px(px(24.))
+            .py(px(18.))
+            .flex()
+            .flex_col()
+            .gap(px(14.));
 
         if let Some(step) = self.page.step_index() {
             contents = contents.child(stepper(step));
@@ -2077,16 +2468,25 @@ impl Render for Setup {
 
         contents = contents.child(
             div()
+                .w_full()
+                .min_w_0()
                 .font_weight(FontWeight::SEMIBOLD)
-                .text_size(px(22.))
+                .text_size(px(20.))
                 .text_color(c(0xf4f4f6))
                 .child(self.title()),
         );
 
-        // Live busy banner (with streaming Ollama pull progress bar + Cancel button!)
+        // Actionable Ollama banner whenever Ollama is missing or stopped
+        if let Some(ollama_banner) = self.ollama_action_banner(cx) {
+            contents = contents.child(ollama_banner);
+        }
+
+        // Live busy banner (with streaming Ollama pull progress bar + Cancel)
         if let Some(status) = &self.busy {
             let pull = self.pull_progress.lock().ok().and_then(|g| g.clone());
             let mut banner = div()
+                .w_full()
+                .min_w_0()
                 .p(px(12.))
                 .rounded(px(12.))
                 .bg(ca(0x6366f116))
@@ -2097,16 +2497,26 @@ impl Render for Setup {
                 .gap(px(8.))
                 .child(
                     div()
+                        .w_full()
+                        .min_w_0()
                         .flex()
                         .flex_row()
                         .items_center()
                         .justify_between()
                         .gap(px(10.))
                         .child(
-                            row()
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.))
                                 .child(icon("loader-circle", 15., c(0x818cf8)))
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w_0()
                                         .text_size(px(13.))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(c(0xe0e7ff))
@@ -2151,74 +2561,110 @@ impl Render for Setup {
             contents = contents.child(banner);
         }
 
-        // Crisp dark error / missing-model notice
+        // Crisp dark error / missing-model notice (strictly overflow-safe!)
         if let Some(problem) = &self.problem {
-            let (is_missing, message) = match problem {
-                Failure::MissingModel => (
-                    true,
-                    format!(
-                        "{} is not downloaded in local Ollama yet. Install it locally to generate suggestions and comparisons.",
-                        model.display_name()
+            let (accent, bg, border, message, cta): (Hsla, Hsla, Hsla, String, Option<Stateful<Div>>) =
+                match problem {
+                    Failure::MissingModel => (
+                        c(0xfbbf24),
+                        ca(0xfbbf2414),
+                        ca(0xfbbf2448),
+                        format!(
+                            "{} is not downloaded in local Ollama yet. Download it locally to generate suggestions and comparisons.",
+                            model.display_name()
+                        ),
+                        Some(action_primary(cx, "get-model", "Download model", |s, _, cx| {
+                            s.download(cx)
+                        })),
                     ),
-                ),
-                Failure::Message(error) => (false, (*error).to_string()),
-            };
-            let accent = if is_missing { c(0xfbbf24) } else { c(0xf87171) };
-            let mut notice = div()
+                    Failure::OllamaStopped => (
+                        c(0xfbbf24),
+                        ca(0xfbbf2414),
+                        ca(0xfbbf2448),
+                        "Ollama is installed but stopped. Start it locally to continue.".into(),
+                        Some(action_primary(
+                            cx,
+                            "err-start-ollama",
+                            "Start Ollama",
+                            |s, _, cx| s.start_ollama(cx),
+                        )),
+                    ),
+                    Failure::OllamaNotInstalled => (
+                        c(0x818cf8),
+                        ca(0x6366f114),
+                        ca(0x818cf848),
+                        "Ollama is not installed yet. Install local Ollama to generate rewrites."
+                            .into(),
+                        Some(action_primary(
+                            cx,
+                            "err-install-ollama",
+                            "Install Ollama",
+                            |s, _, cx| s.install_ollama(cx),
+                        )),
+                    ),
+                    Failure::Message(error) => (
+                        c(0xf87171),
+                        ca(0xf8717114),
+                        ca(0xf8717148),
+                        (*error).to_string(),
+                        None,
+                    ),
+                };
+
+            let notice = div()
+                .w_full()
+                .min_w_0()
                 .p(px(12.))
                 .rounded(px(12.))
-                .bg(if is_missing {
-                    ca(0xfbbf2414)
-                } else {
-                    ca(0xf8717114)
-                })
+                .bg(bg)
                 .border_1()
-                .border_color(if is_missing {
-                    ca(0xfbbf2448)
-                } else {
-                    ca(0xf8717148)
-                })
+                .border_color(border)
                 .flex()
                 .flex_row()
                 .items_center()
                 .justify_between()
                 .gap(px(12.))
                 .child(
-                    row()
+                    div()
                         .flex_1()
-                        .child(icon("triangle-alert", 15., accent))
+                        .min_w_0()
+                        .flex()
+                        .flex_row()
+                        .items_start()
+                        .gap(px(8.))
+                        .child(div().pt(px(2.)).flex_none().child(icon("triangle-alert", 15., accent)))
                         .child(
                             div()
                                 .flex_1()
-                                .text_size(px(13.))
+                                .min_w_0()
+                                .text_size(px(12.5))
+                                .line_height(px(18.))
                                 .text_color(c(0xf4f4f6))
                                 .child(message),
                         ),
-                );
-            if is_missing {
-                notice = notice.child(action_primary(
-                    cx,
-                    "get-model",
-                    "Download model",
-                    |s, _, cx| s.download(cx),
-                ));
-            }
+                )
+                .when_some(cta, |d, btn_el| d.child(btn_el));
             contents = contents.child(notice);
         }
 
-        // Studio header bar
+        // Studio top header bar
         let (dot_color, status_text) = match self.model_status {
             ModelStatus::Ready => (c(0x4ade80), format!("{} · Ready", model.short_label())),
-            ModelStatus::Missing => (c(0xfbbf24), format!("{} · Not installed", model.short_label())),
+            ModelStatus::Missing => (
+                c(0xfbbf24),
+                format!("{} · Not downloaded", model.short_label()),
+            ),
             ModelStatus::Checking => (c(0x818cf8), "Checking Ollama…".to_string()),
-            ModelStatus::Offline(_) => (c(0xf87171), "Ollama offline".to_string()),
+            ModelStatus::OllamaStopped => (c(0xfbbf24), "Ollama stopped · Click to recheck".into()),
+            ModelStatus::OllamaNotInstalled => (c(0xf87171), "Ollama not installed".into()),
+            ModelStatus::Error(_) => (c(0xf87171), "Ollama offline".into()),
         };
 
         let mut header = div()
             .flex_none()
             .w_full()
             .px(px(20.))
-            .py(px(12.))
+            .py(px(11.))
             .bg(c(0x101018))
             .border_b_1()
             .border_color(ca(0xffffff14))
@@ -2232,6 +2678,7 @@ impl Render for Setup {
                     .gap(px(10.))
                     .child(
                         div()
+                            .flex_none()
                             .size(px(26.))
                             .rounded(px(8.))
                             .bg(ca(0x6366f128))
@@ -2251,27 +2698,37 @@ impl Render for Setup {
                     )
                     .child(
                         div()
-                            .px(px(8.))
-                            .py(px(3.))
+                            .id("header-ollama-status")
+                            .px(px(9.))
+                            .py(px(3.5))
                             .rounded(px(999.))
                             .bg(ca(0xffffff0a))
                             .border_1()
-                            .border_color(ca(0xffffff14))
+                            .border_color(ca(0xffffff16))
                             .flex()
                             .flex_row()
                             .items_center()
                             .gap(px(6.))
+                            .cursor_pointer()
+                            .hover(|s| s.bg(ca(0xffffff16)))
                             .child(div().size(px(6.5)).rounded_full().bg(dot_color))
                             .child(
                                 div()
                                     .text_size(px(11.))
                                     .text_color(c(0xd1d5db))
                                     .child(status_text),
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| {
+                                    cx.stop_propagation();
+                                    view.probe_active_model(cx);
+                                }),
                             ),
                     ),
             );
 
-        let mut right_bar = row().gap(px(8.)).child(
+        let mut right_bar = row().flex_none().gap(px(8.)).child(
             div()
                 .id("studio-optional-toggle")
                 .px(px(10.))
@@ -2319,9 +2776,14 @@ impl Render for Setup {
 
         if self.page != Page::Done {
             right_bar = right_bar
-                .child(action(cx, "continue-later", "Continue later", |_, window, _| {
-                    window.minimize_window();
-                }))
+                .child(action(
+                    cx,
+                    "continue-later",
+                    "Continue later",
+                    |_, window, _| {
+                        window.minimize_window();
+                    },
+                ))
                 .child(action_ghost(cx, "discard-setup", "Close", |s, window, cx| {
                     s.stop_job();
                     cx.global_mut::<SetupWindow>().0 = None;
@@ -2341,6 +2803,8 @@ impl Render for Setup {
                 self.comparison_index
             };
 
+        let footer = self.footer_bar(cx);
+
         div()
             .size_full()
             .flex()
@@ -2354,14 +2818,10 @@ impl Render for Setup {
                     .id(("profile-scroll", page_id))
                     .flex_1()
                     .min_h_0()
+                    .w_full()
                     .overflow_y_scroll()
-                    .child(
-                        div()
-                            .w_full()
-                            .flex()
-                            .justify_center()
-                            .child(contents.child(page)),
-                    ),
+                    .child(contents.child(page)),
             )
+            .when_some(footer, |d, f| d.child(f))
     }
 }
